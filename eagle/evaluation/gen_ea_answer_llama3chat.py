@@ -159,7 +159,7 @@ def get_model_answers(
             torch.cuda.synchronize()
             start_time = time.time()
 
-            output_ids, new_token, idx = model.eagenerate(
+            output_ids, new_token, idx, accept_lengths = model.eagenerate(
                 torch.as_tensor(input_ids).cuda(),
                 temperature=temperature,
                 log=True,
@@ -241,7 +241,7 @@ def get_model_answers(
                 torch.cuda.synchronize()
                 start_time = time.time()
 
-                output_ids, new_token, idx = model.eagenerate(
+                output_ids, new_token, idx, accept_lengths = model.eagenerate(
                     torch.as_tensor(input_ids).cuda(),
                     temperature=temperature,
                     log=True,

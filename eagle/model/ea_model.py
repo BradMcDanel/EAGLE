@@ -14,6 +14,8 @@ from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 #from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen2_kv import Qwen2ForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
+from .modeling_qwen3_moe_kv import KVQwen3MoeForCausalLM
+from .modeling_olmoe_kv import OlmoeForCausalLM as KVOlmoeForCausalLM
 from .utils import *
 from .kv_cache import initialize_past_key_values
 
@@ -43,7 +45,7 @@ class EaModel(nn.Module):
         self.hidden_size = base_model.lm_head.weight.shape[-1]
         self.vocab_size = base_model.lm_head.weight.shape[0]
         self.base_model_name_or_path = base_model_name_or_path
-        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, trust_remote_code=True)
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path, "r") as f:
@@ -110,6 +112,14 @@ class EaModel(nn.Module):
             )
         elif Type == 'Qwen3ForCausalLM':
             base_model = KVQwen3ForCausalLM.from_pretrained(
+                base_model_path, **kwargs
+            )
+        elif Type == 'Qwen3MoeForCausalLM':
+            base_model = KVQwen3MoeForCausalLM.from_pretrained(
+                base_model_path, **kwargs
+            )
+        elif Type == 'OlmoeForCausalLM':
+            base_model = KVOlmoeForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
         else:
@@ -247,6 +257,7 @@ class EaModel(nn.Module):
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
+        accept_lengths = []  # Track acceptance lengths per iteration
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
             # with Timer("all"):
@@ -270,7 +281,7 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
-            # print(accept_length)
+            accept_lengths.append(accept_length)
             # Adjusting the input sequence, draft model forward
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
@@ -300,7 +311,7 @@ class EaModel(nn.Module):
         if not log:
             return input_ids
         else:
-            return input_ids, new_token, idx
+            return input_ids, new_token, idx, accept_lengths
 
     @torch.no_grad()
     def naivegenerate(

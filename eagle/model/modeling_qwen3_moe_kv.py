@@ -30,19 +30,25 @@ from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
+)
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-    QuestionAnsweringModelOutput,
+    MoeCausalLMOutputWithPast,
+    MoeModelOutputWithPast,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
+    QuestionAnsweringModelOutput,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import auto_docstring, can_return_tuple, logging
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils.generic import OutputRecorder
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 # LossKwargs fallback for compatibility
 try:
@@ -55,6 +61,15 @@ except ImportError:
 
 
 logger = logging.get_logger(__name__)
+
+
+# KV cache wrapper class for EAGLE compatibility
+class KVQwen3MoeForCausalLM:
+    """Wrapper class to expose the KV-modified Qwen3 MoE model for EAGLE."""
+    @staticmethod
+    def from_pretrained(*args, **kwargs):
+        return Qwen3MoeForCausalLM.from_pretrained(*args, **kwargs)
+
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -121,11 +136,94 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     )
 
 
+# Copied from transformers.models.mixtral.modeling_mixtral.load_balancing_loss_func
+def load_balancing_loss_func(
+    gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
+    num_experts: Optional[int] = None,
+    top_k=2,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, int]:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+
+    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+
+    Returns:
+        The auxiliary loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+    if attention_mask is None:
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
+
+
 @use_kernel_forward_from_hub("RMSNorm")
-class Qwen3RMSNorm(nn.Module):
+class Qwen3MoeRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        Qwen3RMSNorm is equivalent to T5LayerNorm
+        Qwen3MoeRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -142,12 +240,12 @@ class Qwen3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class Qwen3MLP(nn.Module):
-    def __init__(self, config):
+class Qwen3MoeMLP(nn.Module):
+    def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -156,6 +254,60 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+
+
+class Qwen3MoeSparseMoeBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+
+        # gating
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """ """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
 
 
 def rotate_half(x):
@@ -230,10 +382,10 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class Qwen3Attention(nn.Module):
+class Qwen3MoeAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -255,9 +407,9 @@ class Qwen3Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.sliding_window = getattr(config, "sliding_window", None)
 
     def forward(
         self,
@@ -307,17 +459,23 @@ class Qwen3Attention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class Qwen3DecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen3MoeAttention(config=config, layer_idx=layer_idx)
 
-        self.mlp = Qwen3MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention_type = config.layer_types[layer_idx]
+        if (layer_idx not in config.mlp_only_layers) and (
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(config)
+        else:
+            self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
+
+        self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
 
     def forward(
         self,
@@ -352,6 +510,9 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        # For the MoE layers, we need to unpack
+        if isinstance(hidden_states, tuple):
+            hidden_states, _ = hidden_states
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -363,11 +524,11 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
-class Qwen3PreTrainedModel(PreTrainedModel):
-    config_class = Qwen3Config
+class Qwen3MoePreTrainedModel(PreTrainedModel):
+    config_class = Qwen3MoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3DecoderLayer"]
+    _no_split_modules = ["Qwen3MoeDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn_3 = True
     _supports_flash_attn_2 = True
@@ -388,12 +549,12 @@ class Qwen3PreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, Qwen3RMSNorm):
+        elif isinstance(module, Qwen3MoeRMSNorm):
             module.weight.data.fill_(1.0)
 
 
-class Qwen3RotaryEmbedding(nn.Module):
-    def __init__(self, config: Qwen3Config, device=None):
+class Qwen3MoeRotaryEmbedding(nn.Module):
+    def __init__(self, config: Qwen3MoeConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -427,20 +588,20 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 @auto_docstring
-class Qwen3Model(Qwen3PreTrainedModel):
-    def __init__(self, config: Qwen3Config):
+class Qwen3MoeModel(Qwen3MoePreTrainedModel):
+    def __init__(self, config: Qwen3MoeConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+        
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -500,7 +661,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> BaseModelOutputWithPast:
+    ) -> MoeModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -558,25 +719,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values_length,
         )
 
-        # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            # The sliding window alternating layers are not always activated depending on the config
-            if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
@@ -596,7 +738,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
             layer_outputs = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
@@ -617,7 +759,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutputWithPast(
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
@@ -629,14 +771,14 @@ class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
 @auto_docstring
-class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3MoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -677,7 +819,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
-    ) -> CausalLMOutputWithPast:
+    ) -> MoeCausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -728,7 +870,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        return MoeCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -751,11 +893,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     each row of the batch).
     """
 )
-class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
+class Qwen3MoeForSequenceClassification(Qwen3MoePreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = Qwen3Model(config)
+        self.model = Qwen3MoeModel(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
@@ -838,11 +980,11 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
 
 
 @auto_docstring
-class Qwen3ForTokenClassification(Qwen3PreTrainedModel):
+class Qwen3MoeForTokenClassification(Qwen3MoePreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = Qwen3Model(config)
+        self.model = Qwen3MoeModel(config)
         if getattr(config, "classifier_dropout", None) is not None:
             classifier_dropout = config.classifier_dropout
         elif getattr(config, "hidden_dropout", None) is not None:
@@ -909,12 +1051,12 @@ class Qwen3ForTokenClassification(Qwen3PreTrainedModel):
 
 
 @auto_docstring
-class Qwen3ForQuestionAnswering(Qwen3PreTrainedModel):
+class Qwen3MoeForQuestionAnswering(Qwen3MoePreTrainedModel):
     base_model_prefix = "transformer"
 
     def __init__(self, config):
         super().__init__(config)
-        self.transformer = Qwen3Model(config)
+        self.transformer = Qwen3MoeModel(config)
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
 
         # Initialize weights and apply final processing
@@ -972,10 +1114,10 @@ class Qwen3ForQuestionAnswering(Qwen3PreTrainedModel):
 
 
 __all__ = [
-    "Qwen3ForCausalLM",
-    "Qwen3ForQuestionAnswering",
-    "Qwen3Model",
-    "Qwen3PreTrainedModel",
-    "Qwen3ForSequenceClassification",
-    "Qwen3ForTokenClassification",
+    "Qwen3MoeForCausalLM",
+    "Qwen3MoeForQuestionAnswering",
+    "Qwen3MoeModel",
+    "Qwen3MoePreTrainedModel",
+    "Qwen3MoeForSequenceClassification",
+    "Qwen3MoeForTokenClassification",
 ]
