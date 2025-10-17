@@ -768,7 +768,7 @@ class Model(nn.Module):
         mask_index = mask_index + 1
         mask_index_list = mask_index.tolist()
         # with Timer("mask"):
-        tree_mask = torch.eye(total_tokens + 1).bool()
+        tree_mask = torch.eye(total_tokens + 1, device=hidden_states.device).bool()
         tree_mask[:, 0] = True
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
@@ -778,6 +778,8 @@ class Model(nn.Module):
 
         tree_mask = tree_mask.float()[None, None]
         draft_tokens = draft_tokens[None]
+
+        tree_parents = torch.tensor([-1] + mask_index_list, dtype=torch.long, device=hidden_states.device)
 
         del parents_list, scores_list, ss_token, ss_token_list, draft_parents
 
@@ -819,7 +821,7 @@ class Model(nn.Module):
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
-        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
+        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents
 
 
 

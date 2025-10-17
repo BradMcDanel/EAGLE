@@ -111,7 +111,7 @@ def run_evaluation(
 
             start = time.time()
             if use_eagle:
-                output_ids, _, _, _ = model.eagenerate(
+                output_ids, _, _, _, _ = model.eagenerate(
                     torch.as_tensor(input_ids).to(model.base_model.device),
                     temperature=temperature,
                     max_new_tokens=max_new_tokens,
@@ -168,7 +168,7 @@ def run_evaluation(
             start_time = time.time()
 
             if use_eagle:
-                output_ids, new_tokens, iterations, accept_lengths = model.eagenerate(
+                output_ids, new_tokens, iterations, accept_lengths, iteration_traces = model.eagenerate(
                     torch.as_tensor(input_ids).to(model.base_model.device),
                     temperature=temperature,
                     max_new_tokens=max_new_tokens,
@@ -235,6 +235,7 @@ def run_evaluation(
                 turn_stats['tokens_per_iter'] = float(tokens_per_iter)
                 turn_stats['speedup'] = float(speedup)
                 turn_stats['accept_lengths'] = [int(x) for x in accept_lengths]
+                turn_stats['expert_traces'] = iteration_traces
 
             turns_stats.append(turn_stats)
 

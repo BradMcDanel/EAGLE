@@ -268,20 +268,69 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.experts = nn.ModuleList(
             [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
         )
+        self.max_active_experts = getattr(config, "max_active_experts", None)
+        self.layer_idx: Optional[int] = None
+        self.trace_recorder = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def set_max_active_experts(self, value: Optional[int]) -> None:
+        self.max_active_experts = value
+
+    def set_trace_recorder(self, recorder: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]]) -> None:
+        self.trace_recorder = recorder
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        max_active_experts: Optional[int] = None,
+        expert_counter_list=None,
+    ) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
-        routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_probs = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+
+        if max_active_experts is None:
+            max_active_experts = self.max_active_experts
+
+        if max_active_experts is not None:
+            budget = min(max_active_experts, self.num_experts)
+            if budget < self.top_k:
+                raise ValueError(
+                    f"max_active_experts ({budget}) must be >= top_k ({self.top_k})"
+                )
+            mass = routing_probs.sum(dim=0)
+            keep = torch.topk(mass, k=budget, largest=True).indices
+            kept_probs = routing_probs.index_select(1, keep)
+            routing_weights, selected_local = torch.topk(
+                kept_probs, self.top_k, dim=-1
+            )
+            selected_experts = keep[selected_local]
+        else:
+            routing_weights, selected_experts = torch.topk(
+                routing_probs, self.top_k, dim=-1
+            )
+
         if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
+        selected_experts = selected_experts.to(torch.long)
+
+        if self.trace_recorder is not None:
+            try:
+                experts_per_token = selected_experts.view(batch_size, sequence_length, self.top_k)
+                weights_per_token = routing_weights.view(batch_size, sequence_length, self.top_k)
+            except RuntimeError:
+                experts_per_token = selected_experts.view(1, -1, self.top_k)
+                weights_per_token = routing_weights.view(1, -1, self.top_k)
+            self.trace_recorder(
+                self.layer_idx if self.layer_idx is not None else -1,
+                experts_per_token.detach(),
+                weights_per_token.detach(),
+            )
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -291,11 +340,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # this will be used to easily index which expert is going to be sollicitated
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
-        # Loop over all available experts in the model and perform the computation on each expert
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
+        expert_hit_all = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False).squeeze(-1)
+        expert_hit = expert_hit_all
+
+        if expert_counter_list is not None:
+            expert_counter_list.append(int(expert_hit.numel()))
+
+        for expert_idx in expert_hit.tolist():
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            idx, top_x = torch.where(expert_mask[expert_idx])
 
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
@@ -472,6 +525,9 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
             self.mlp = Qwen3MoeSparseMoeBlock(config)
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
+
+        if isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
+            self.mlp.layer_idx = layer_idx
 
         self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

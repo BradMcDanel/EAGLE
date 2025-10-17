@@ -760,20 +760,19 @@ class Model(nn.Module):
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
+        top_scores_index = torch.sort(top_scores.indices).values.to(hidden_states.device)
 
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
 
-        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
+        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].to(hidden_states.device, dtype=torch.long)
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
         # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
         mask_index[draft_parents == 0] = -1
-        mask_index = mask_index + 1
-        mask_index_list = mask_index.tolist()
+        mask_index = (mask_index + 1).to(hidden_states.device, dtype=torch.long)
+        mask_index_list = mask_index.cpu().tolist()
         # with Timer("mask"):
-        tree_mask = torch.eye(total_tokens + 1).bool()
+        tree_mask = torch.eye(total_tokens + 1, device=hidden_states.device).bool()
         tree_mask[:, 0] = True
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
@@ -783,6 +782,8 @@ class Model(nn.Module):
 
         tree_mask = tree_mask.float()[None, None]
         draft_tokens = draft_tokens[None]
+
+        tree_parents = torch.tensor([-1] + mask_index_list, dtype=torch.long, device=hidden_states.device)
 
         del parents_list, scores_list, ss_token, ss_token_list, draft_parents
 
@@ -824,7 +825,7 @@ class Model(nn.Module):
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
-        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
+        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents
 
 
 

@@ -39,6 +39,17 @@ except:
     from model.utils import prepare_logits_processor
 
 
+def configure_max_active_experts(model: torch.nn.Module, max_active_experts: int) -> int:
+    """Propagate a per-wave expert budget to every supported MoE block."""
+    updated = 0
+    for module in model.modules():
+        setter = getattr(module, "set_max_active_experts", None)
+        if callable(setter):
+            setter(max_active_experts)
+            updated += 1
+    return updated
+
+
 @torch.inference_mode()
 def run_evaluation(
     base_model_path,
@@ -89,6 +100,16 @@ def run_evaluation(
     )
     model.eval()
     tokenizer = model.get_tokenizer()
+
+    if args.max_active_experts is not None:
+        updated_blocks = configure_max_active_experts(model.base_model, args.max_active_experts)
+        if updated_blocks:
+            print(
+                f"Capping active experts per wave to {args.max_active_experts}"
+                f" across {updated_blocks} MoE blocks"
+            )
+        else:
+            print("Warning: max_active_experts set but no MoE blocks support this option")
 
     # Detect if this is a Llama-3, OLMoE, or Qwen3 model (all use tokenizer chat templates)
     is_llama3 = "llama-3" in base_model_path.lower() or "llama3" in base_model_path.lower()
@@ -146,12 +167,13 @@ def run_evaluation(
 
             start = time.time()
             if use_eagle:
-                output_ids, _, _, _ = model.eagenerate(
+                output_ids, _, _, _, _ = model.eagenerate(
                     torch.as_tensor(input_ids).to(model.base_model.device),
                     temperature=temperature,
                     max_new_tokens=args.warmup_tokens,
                     log=True,
-                    is_llama3=is_llama3
+                    is_llama3=is_llama3,
+                    collect_expert_traces=args.collect_expert_traces,
                 )
             else:
                 # Baseline: use naivegenerate (optimized AR decoding)
@@ -223,12 +245,13 @@ def run_evaluation(
             start_time = time.time()
 
             if use_eagle:
-                output_ids, new_tokens, iterations, accept_lengths = model.eagenerate(
+                output_ids, new_tokens, iterations, accept_lengths, iteration_traces = model.eagenerate(
                     torch.as_tensor(input_ids).to(model.base_model.device),
                     temperature=temperature,
                     max_new_tokens=max_new_tokens,
                     log=True,
-                    is_llama3=is_llama3
+                    is_llama3=is_llama3,
+                    collect_expert_traces=args.collect_expert_traces,
                 )
             else:
                 # Baseline: use naivegenerate (optimized AR decoding)
@@ -292,6 +315,8 @@ def run_evaluation(
                 turn_stats['tokens_per_iter'] = float(tokens_per_iter)
                 turn_stats['speedup'] = float(speedup)
                 turn_stats['accept_lengths'] = [int(x) for x in accept_lengths]
+                if args.collect_expert_traces:
+                    turn_stats['expert_traces'] = iteration_traces
 
             turns_stats.append(turn_stats)
 
@@ -395,6 +420,10 @@ if __name__ == "__main__":
                         help="Use EAGLE-3 mode")
     parser.add_argument("--total-token", type=int, default=63,
                         help="Number of draft tokens for EAGLE")
+    parser.add_argument("--max-active-experts", type=int, default=None,
+                        help="Cap the number of active experts dispatched per wave (default: unlimited)")
+    parser.add_argument("--collect-expert-traces", action="store_true",
+                        help="Capture per-iteration draft tree and routing traces (adds overhead)")
 
     args = parser.parse_args()
 

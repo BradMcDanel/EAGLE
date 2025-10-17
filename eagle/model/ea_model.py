@@ -1,6 +1,7 @@
 import copy
 import json
 import time
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,37 @@ from .kv_cache import initialize_past_key_values
 from .cnets import Model
 from .cnets1 import Model as Model1
 from .configs import EConfig
+
+
+class ExpertTraceCollector:
+    """Collects per-layer expert routing data for a single forward pass."""
+
+    def __init__(self) -> None:
+        self.records: Dict[int, Dict[str, List]] = {}
+
+    def record(self, layer_idx: int, experts: torch.Tensor, weights: torch.Tensor) -> None:
+        experts_cpu = experts.to(torch.int64).cpu()
+        weights_cpu = weights.to(torch.float32).cpu()
+        self.records[int(layer_idx)] = {
+            "experts": experts_cpu.tolist(),
+            "weights": weights_cpu.tolist(),
+        }
+
+    def to_serializable(self) -> Dict[str, Dict[str, List]]:
+        return {str(k): v for k, v in sorted(self.records.items())}
+
+
+def set_expert_trace_recorder(model: nn.Module, collector: Optional[ExpertTraceCollector]) -> int:
+    """Attach or clear expert trace recorders across all supported MoE blocks."""
+
+    updated = 0
+    recorder = collector.record if collector is not None else None
+    for module in model.modules():
+        setter = getattr(module, "set_trace_recorder", None)
+        if callable(setter):
+            setter(recorder)
+            updated += 1
+    return updated
 
 
 class EaModel(nn.Module):
@@ -216,6 +248,7 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
+            collect_expert_traces=False,
 
     ):
         if is_llama3:
@@ -253,18 +286,38 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         # prefill
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+        (
+            draft_tokens,
+            retrieve_indices,
+            tree_mask,
+            tree_position_ids,
+            tree_parents,
+            logits,
+            hidden_state,
+            sample_token,
+        ) = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
         accept_lengths = []  # Track acceptance lengths per iteration
+        iteration_traces: List[Dict[str, Any]] = []
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
+            # Snapshot current tree before verification (CPU copies for logging)
+            if collect_expert_traces:
+                iter_draft_tokens = draft_tokens.detach().to("cpu")
+                iter_tree_parents = tree_parents.detach().to("cpu")
+                iter_tree_position_ids = tree_position_ids.detach().to("cpu")
+                iter_retrieve_indices = retrieve_indices.detach().to("cpu")
+
             draft_tokens = draft_tokens.to(input_ids.device)
             # Target model forward, get logits
+            collector = ExpertTraceCollector() if collect_expert_traces else None
+            if collector is not None:
+                set_expert_trace_recorder(self.base_model.model, collector)
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -273,6 +326,8 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            if collector is not None:
+                set_expert_trace_recorder(self.base_model.model, None)
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
@@ -281,9 +336,39 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
-            accept_lengths.append(accept_length)
+            best_candidate_val = (
+                int(best_candidate.item()) if isinstance(best_candidate, torch.Tensor) else int(best_candidate)
+            )
+            accept_length_val = (
+                int(accept_length.item()) if isinstance(accept_length, torch.Tensor) else int(accept_length)
+            )
+            accept_lengths.append(accept_length_val)
+
+            if collect_expert_traces:
+                accepted_path = iter_retrieve_indices[best_candidate_val, : accept_length_val + 1].tolist()
+                iteration_traces.append(
+                    {
+                        "iteration": idx,
+                        "tokens": iter_draft_tokens[0].tolist(),
+                        "parents": iter_tree_parents.tolist(),
+                        "depth": iter_tree_position_ids.tolist(),
+                        "retrieve_indices": iter_retrieve_indices.tolist(),
+                        "accepted_nodes": accepted_path,
+                        "experts": collector.to_serializable() if collector is not None else {},
+                    }
+                )
             # Adjusting the input sequence, draft model forward
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+            (
+                input_ids,
+                draft_tokens,
+                retrieve_indices,
+                tree_mask,
+                tree_position_ids,
+                tree_parents,
+                new_token,
+                hidden_state,
+                sample_token,
+            ) = update_inference_inputs(
                 input_ids,
                 candidates,
                 best_candidate,
@@ -311,7 +396,9 @@ class EaModel(nn.Module):
         if not log:
             return input_ids
         else:
-            return input_ids, new_token, idx, accept_lengths
+            if collect_expert_traces:
+                set_expert_trace_recorder(self.base_model.model, None)
+            return input_ids, new_token, idx, accept_lengths, iteration_traces
 
     @torch.no_grad()
     def naivegenerate(
