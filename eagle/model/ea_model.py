@@ -1,6 +1,7 @@
 import copy
 import json
 import time
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -54,6 +55,144 @@ def set_expert_trace_recorder(model: nn.Module, collector: Optional[ExpertTraceC
             setter(recorder)
             updated += 1
     return updated
+
+
+def set_token_routing_weights(model: nn.Module, weights: Optional[torch.Tensor]) -> int:
+    """Propagate per-token routing weights to all MoE blocks."""
+
+    updated = 0
+    for module in model.modules():
+        setter = getattr(module, "set_token_routing_weights", None)
+        if callable(setter):
+            setter(weights)
+            updated += 1
+    return updated
+
+
+def compute_subtree_weights(tree_parents: torch.Tensor, tree_position_ids: torch.Tensor) -> torch.Tensor:
+    """Return subtree weights for each node (broadcasting over batch if needed)."""
+
+    if tree_parents.dim() == 1:
+        return _compute_single_subtree_weights(tree_parents, tree_position_ids)
+
+    weights = []
+    for b in range(tree_parents.size(0)):
+        weights.append(_compute_single_subtree_weights(tree_parents[b], tree_position_ids[b]))
+    return torch.stack(weights, dim=0)
+
+
+def _compute_single_subtree_weights(tree_parents: torch.Tensor, tree_position_ids: torch.Tensor) -> torch.Tensor:
+    num_nodes = tree_parents.numel()
+    weights = torch.ones(num_nodes, dtype=torch.float32, device=tree_parents.device)
+
+    depths = tree_position_ids.to(torch.long)
+    order = torch.argsort(depths, descending=True)
+    for idx in order.tolist():
+        parent = int(tree_parents[idx].item())
+        if parent >= 0:
+            weights[parent] += weights[idx]
+
+    weights /= weights.sum()
+    return weights
+
+
+def summarize_layer_experts(
+    layer_record: Dict[str, List],
+    node_depths: List[int],
+    accepted_nodes: set,
+) -> Dict[str, Any]:
+    """Build per-layer aggregate statistics over expert routes."""
+
+    experts_list = layer_record.get("experts", []) or []
+    weights_list = layer_record.get("weights", []) or []
+
+    def _collapse_batch_axis(values: List) -> List:
+        if not isinstance(values, list):
+            return []
+        if not values:
+            return []
+        first = values[0]
+        if isinstance(first, list):
+            if len(values) == 1:
+                return first
+            flattened: List = []
+            for item in values:
+                if isinstance(item, list):
+                    flattened.extend(item)
+                else:
+                    flattened.append(item)
+            return flattened
+        return values
+
+    def _flatten_numbers(values) -> List[float]:
+        result: List[float] = []
+        if isinstance(values, (list, tuple)):
+            for item in values:
+                result.extend(_flatten_numbers(item))
+        elif values is not None:
+            try:
+                result.append(float(values))
+            except (TypeError, ValueError):
+                pass
+        return result
+
+    per_node_experts = _collapse_batch_axis(experts_list)
+    per_node_weights = _collapse_batch_axis(weights_list)
+
+    depth_unique: Dict[int, set] = defaultdict(set)
+    accepted_depth_unique: Dict[int, set] = defaultdict(set)
+    depth_weight: Dict[int, float] = defaultdict(float)
+    accepted_depth_weight: Dict[int, float] = defaultdict(float)
+
+    total_unique: set = set()
+    accepted_unique: set = set()
+    total_weight = 0.0
+    accepted_weight = 0.0
+
+    for node_idx, node_experts in enumerate(per_node_experts):
+        if node_experts is None:
+            continue
+
+        flat_experts = _flatten_numbers(node_experts)
+        if not flat_experts:
+            continue
+
+        experts_int = [int(e) for e in flat_experts]
+        total_unique.update(experts_int)
+
+        node_depth = node_depths[node_idx] if node_idx < len(node_depths) else None
+        if node_depth is not None:
+            depth_unique[node_depth].update(experts_int)
+
+        if node_idx in accepted_nodes:
+            accepted_unique.update(experts_int)
+            if node_depth is not None:
+                accepted_depth_unique[node_depth].update(experts_int)
+
+        node_weights = per_node_weights[node_idx] if node_idx < len(per_node_weights) else []
+        flat_weights = _flatten_numbers(node_weights)
+        if flat_weights:
+            weight_sum = float(sum(flat_weights[: len(experts_int)]))
+            total_weight += weight_sum
+            if node_depth is not None:
+                depth_weight[node_depth] += weight_sum
+            if node_idx in accepted_nodes:
+                accepted_weight += weight_sum
+                if node_depth is not None:
+                    accepted_depth_weight[node_depth] += weight_sum
+
+    return {
+        "total_unique": len(total_unique),
+        "accepted_unique": len(accepted_unique),
+        "total_unique_ids": sorted(total_unique),
+        "accepted_unique_ids": sorted(accepted_unique),
+        "depth_unique": {str(k): len(v) for k, v in depth_unique.items() if v},
+        "accepted_depth_unique": {str(k): len(v) for k, v in accepted_depth_unique.items() if v},
+        "depth_weight": {str(k): depth_weight[k] for k in depth_weight},
+        "accepted_depth_weight": {str(k): accepted_depth_weight[k] for k in accepted_depth_weight},
+        "total_weight": total_weight,
+        "accepted_weight": accepted_weight,
+    }
 
 
 class EaModel(nn.Module):
@@ -218,6 +357,7 @@ class EaModel(nn.Module):
             past_key_values=None,
             output_orig=False,
             position_ids=None,
+            output_hidden_states: bool = False,
     ):
 
         with torch.inference_mode():
@@ -227,6 +367,7 @@ class EaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                output_hidden_states=output_hidden_states,
             )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
@@ -292,6 +433,7 @@ class EaModel(nn.Module):
             tree_mask,
             tree_position_ids,
             tree_parents,
+            draft_log_probs,
             logits,
             hidden_state,
             sample_token,
@@ -312,12 +454,31 @@ class EaModel(nn.Module):
                 iter_tree_parents = tree_parents.detach().to("cpu")
                 iter_tree_position_ids = tree_position_ids.detach().to("cpu")
                 iter_retrieve_indices = retrieve_indices.detach().to("cpu")
+                iter_draft_log_probs = draft_log_probs.detach().to("cpu")
 
             draft_tokens = draft_tokens.to(input_ids.device)
             # Target model forward, get logits
             collector = ExpertTraceCollector() if collect_expert_traces else None
             if collector is not None:
                 set_expert_trace_recorder(self.base_model.model, collector)
+
+            routing_weights = None
+            subtree_weights_cpu = None
+            routing_weights_cpu = None
+            try:
+                subtree_weights = compute_subtree_weights(tree_parents, tree_position_ids)
+                if subtree_weights is not None:
+                    if subtree_weights.dim() == 1:
+                        subtree_weights = subtree_weights.unsqueeze(0)
+                    subtree_weights = subtree_weights.to(draft_tokens.device)
+                    routing_weights = subtree_weights.reshape(-1)
+                    set_token_routing_weights(self.base_model.model, routing_weights)
+                    if collect_expert_traces:
+                        subtree_weights_cpu = subtree_weights.detach().to("cpu").tolist()
+                        routing_weights_cpu = routing_weights.detach().to("cpu").tolist()
+            except Exception:
+                set_token_routing_weights(self.base_model.model, None)
+
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -326,6 +487,8 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+
+            set_token_routing_weights(self.base_model.model, None)
             if collector is not None:
                 set_expert_trace_recorder(self.base_model.model, None)
             # retrieve_indices=tree_buffers["retrieve_indices"]
@@ -344,8 +507,80 @@ class EaModel(nn.Module):
             )
             accept_lengths.append(accept_length_val)
 
+            verification_info: Dict[str, Any] = {}
+            if collect_expert_traces:
+                strategy = "greedy" if logits_processor is None else "posterior"
+                logits_cpu = logits.detach().to("cpu")
+                logits_norm = float(torch.linalg.vector_norm(logits_cpu).item())
+                posterior_slice = logits_cpu[best_candidate_val, : max(1, accept_length_val + 1)]
+                verification_info = {
+                    "strategy": strategy,
+                    "best_candidate": best_candidate_val,
+                    "accept_length": accept_length_val,
+                    "logits_norm": logits_norm,
+                    "posterior_slice": posterior_slice.tolist(),
+                }
+
             if collect_expert_traces:
                 accepted_path = iter_retrieve_indices[best_candidate_val, : accept_length_val + 1].tolist()
+
+                iter_tree_depths = iter_tree_position_ids.view(-1)
+                tree_depth = int(iter_tree_depths.max().item()) if iter_tree_depths.numel() else 0
+                depth_hist = torch.bincount(
+                    iter_tree_depths, minlength=tree_depth + 1
+                ).tolist()
+                total_nodes = int(iter_tree_depths.numel())
+                accepted_nodes_set = {n for n in accepted_path if n >= 0}
+                accepted_len = len(accepted_nodes_set)
+
+                accepted_experts_summary: Dict[str, Any] = {}
+                layer_expert_stats: Dict[str, Any] = {}
+                combined_total_unique = 0
+                combined_accepted_unique = 0
+                if collector is not None:
+                    node_depths_list = iter_tree_depths.tolist()
+                    for layer_idx, layer_record in collector.records.items():
+                        stats = summarize_layer_experts(layer_record, node_depths_list, accepted_nodes_set)
+                        layer_key = str(layer_idx)
+                        layer_expert_stats[layer_key] = stats
+                        accepted_experts_summary[layer_key] = {
+                            "unique_count": stats["accepted_unique"],
+                            "experts": stats["accepted_unique_ids"],
+                        }
+                        combined_total_unique += stats["total_unique"]
+                        combined_accepted_unique += stats["accepted_unique"]
+
+                pruned_nodes = total_nodes - accepted_len
+
+                node_log_probs: Dict[str, float] = {}
+                try:
+                    log_probs = torch.log_softmax(logits, dim=-1).detach().to("cpu")
+                    if log_probs.dim() == 3:
+                        num_cands, seq_len, _ = log_probs.shape
+                        for cand_idx in range(num_cands):
+                            for pos in range(1, iter_retrieve_indices.size(1)):
+                                node_idx = int(iter_retrieve_indices[cand_idx, pos].item())
+                                if node_idx < 0:
+                                    continue
+                                if node_idx >= iter_draft_tokens.size(1):
+                                    continue
+                                token_id = int(iter_draft_tokens[0, node_idx].item())
+                                if token_id < 0 or pos - 1 >= seq_len:
+                                    continue
+                                logp = float(log_probs[cand_idx, pos - 1, token_id].item())
+                                node_log_probs.setdefault(str(node_idx), logp)
+                except Exception:
+                    node_log_probs = {}
+
+                draft_log_probs_dict: Dict[str, float] = {}
+                try:
+                    draft_log_probs_list = iter_draft_log_probs.tolist()
+                    draft_log_probs_dict = {
+                        str(idx): float(val) for idx, val in enumerate(draft_log_probs_list)
+                    }
+                except Exception:
+                    draft_log_probs_dict = {}
+
                 iteration_traces.append(
                     {
                         "iteration": idx,
@@ -354,6 +589,20 @@ class EaModel(nn.Module):
                         "depth": iter_tree_position_ids.tolist(),
                         "retrieve_indices": iter_retrieve_indices.tolist(),
                         "accepted_nodes": accepted_path,
+                        "tree_total_nodes": total_nodes,
+                        "tree_depth": tree_depth,
+                        "tree_width_by_depth": depth_hist,
+                        "accepted_length": accepted_len,
+                        "accepted_unique_experts": accepted_experts_summary,
+                        "layer_expert_stats": layer_expert_stats,
+                        "total_unique_experts": combined_total_unique,
+                        "accepted_unique_experts_count": combined_accepted_unique,
+                        "pruned_nodes": pruned_nodes,
+                        "subtree_weights": subtree_weights_cpu,
+                        "routing_weights": routing_weights_cpu,
+                        "verification": verification_info,
+                        "node_log_probs": node_log_probs,
+                        "draft_node_log_probs": draft_log_probs_dict,
                         "experts": collector.to_serializable() if collector is not None else {},
                     }
                 )
@@ -365,6 +614,7 @@ class EaModel(nn.Module):
                 tree_mask,
                 tree_position_ids,
                 tree_parents,
+                draft_log_probs,
                 new_token,
                 hidden_state,
                 sample_token,
@@ -524,7 +774,7 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents, draft_log_probs, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
@@ -552,7 +802,7 @@ class EaModel(nn.Module):
             )
             # print(accept_length)
             # with Timer("update_inference_inputs"):
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents, draft_log_probs, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
                 best_candidate,

@@ -250,7 +250,7 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         if outputs["hidden_states"][0].device != ea_device:
             outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
         hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, tree_parents = model.ea_layer.topK_genrate(
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, tree_parents, draft_log_probs = model.ea_layer.topK_genrate(
         hidden_states,
         input_ids,
         model.base_model.lm_head,
@@ -262,6 +262,7 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         tree_mask,
         tree_position_ids,
         tree_parents,
+        draft_log_probs,
         orig,
         hidden_states,
         token,
@@ -324,6 +325,7 @@ def tree_decoding(
         tree_position_ids,
         input_ids,
         retrieve_indices,
+        return_hidden_states: bool = False,
 ):
     position_ids = tree_position_ids + input_ids.shape[1]
     if position_ids is not None and position_ids.dim() == 1:
@@ -333,6 +335,7 @@ def tree_decoding(
         output_orig=True,
         past_key_values=past_key_values,
         position_ids=position_ids,
+        output_hidden_states=return_hidden_states,
     )
 
     if model.use_eagle3:
@@ -477,7 +480,7 @@ def update_inference_inputs(
         token = torch.argmax(prob)
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents = model.ea_layer.topK_genrate(
+    draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents, draft_log_probs = model.ea_layer.topK_genrate(
         accept_hidden_state_new,
         input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
         head=model.base_model.lm_head,
@@ -494,6 +497,7 @@ def update_inference_inputs(
         tree_mask,
         tree_position_ids,
         tree_parents,
+        draft_log_probs,
         new_token,
         None,
         token,

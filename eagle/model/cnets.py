@@ -765,6 +765,10 @@ class Model(nn.Module):
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
 
+        draft_log_probs = scores_list[top_scores_index]
+        zero_log = torch.zeros(1, dtype=draft_log_probs.dtype, device=draft_log_probs.device)
+        draft_log_probs = torch.cat((zero_log, draft_log_probs), dim=0)
+
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].to(hidden_states.device, dtype=torch.long)
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
         # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
@@ -825,7 +829,7 @@ class Model(nn.Module):
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
-        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents
+        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, tree_parents, draft_log_probs
 
 
 

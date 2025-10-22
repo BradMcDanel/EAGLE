@@ -50,6 +50,30 @@ def configure_max_active_experts(model: torch.nn.Module, max_active_experts: int
     return updated
 
 
+def configure_max_total_routing_error(
+    model: torch.nn.Module,
+    max_total_routing_error: float,
+    skip_first: int = 0,
+    skip_last: int = 0,
+) -> int:
+    """Propagate a routing-error budget with optional layer skips."""
+    updated = 0
+    for module in model.modules():
+        setter = getattr(module, "set_max_total_routing_error", None)
+        if callable(setter):
+            layer_idx = getattr(module, "layer_idx", None)
+            total_layers = getattr(module, "total_layers", None)
+            if layer_idx is not None and total_layers is not None:
+                if layer_idx < skip_first or layer_idx >= total_layers - skip_last:
+                    setter(None)
+                else:
+                    setter(max_total_routing_error)
+            else:
+                setter(max_total_routing_error)
+            updated += 1
+    return updated
+
+
 @torch.inference_mode()
 def run_evaluation(
     base_model_path,
@@ -110,6 +134,23 @@ def run_evaluation(
             )
         else:
             print("Warning: max_active_experts set but no MoE blocks support this option")
+
+    if args.max_routing_error is not None:
+        if args.max_active_experts is not None:
+            print("Warning: both max_active_experts and max_routing_error set; static cap takes precedence when both are present")
+        updated_blocks = configure_max_total_routing_error(
+            model.base_model,
+            args.max_routing_error,
+            skip_first=args.routing_error_skip_first,
+            skip_last=args.routing_error_skip_last,
+        )
+        if updated_blocks:
+            print(
+                f"Bounding per-layer discarded routing mass at {args.max_routing_error}"
+                f" across {updated_blocks} MoE blocks"
+            )
+        else:
+            print("Warning: max_routing_error set but no MoE blocks support dynamic error budgeting")
 
     # Detect if this is a Llama-3, OLMoE, or Qwen3 model (all use tokenizer chat templates)
     is_llama3 = "llama-3" in base_model_path.lower() or "llama3" in base_model_path.lower()
@@ -422,6 +463,12 @@ if __name__ == "__main__":
                         help="Number of draft tokens for EAGLE")
     parser.add_argument("--max-active-experts", type=int, default=None,
                         help="Cap the number of active experts dispatched per wave (default: unlimited)")
+    parser.add_argument("--max-routing-error", type=float, default=None,
+                        help="Maximum routing probability mass that can be discarded per MoE layer")
+    parser.add_argument("--routing-error-skip-first", type=int, default=0,
+                        help="Number of earliest MoE layers to exclude from routing-error pruning")
+    parser.add_argument("--routing-error-skip-last", type=int, default=0,
+                        help="Number of final MoE layers to exclude from routing-error pruning")
     parser.add_argument("--collect-expert-traces", action="store_true",
                         help="Capture per-iteration draft tree and routing traces (adds overhead)")
 
