@@ -1,11 +1,26 @@
 import copy
 import json
+import math
 import time
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import joblib
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+try:
+    from sklearn.ensemble import HistGradientBoostingClassifier as _HGBCls  # noqa: F401
+    from sklearn.ensemble import HistGradientBoostingRegressor as _HGBReg  # noqa: F401
+    import sklearn._loss._loss as _skloss  # noqa: F401
+    if not hasattr(_skloss, "__pyx_unpickle_CyHalfBinomialLoss"):
+        raise ImportError(
+            "scikit-learn does not expose the required loss unpicklers; "
+            "please ensure the training and runtime environments match."
+        )
+except Exception:
+    pass
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 import os
@@ -44,6 +59,617 @@ class ExpertTraceCollector:
         return {str(k): v for k, v in sorted(self.records.items())}
 
 
+ACCEPT_FEATURES: List[str] = [
+    "depth",
+    "children_count",
+    "is_leaf",
+    "subtree_size",
+    "tree_total_nodes",
+    "tree_depth",
+    "tree_width_at_depth",
+    "draft_log_prob",
+    "routing_weight",
+    "subtree_weight",
+    "layer0_unique",
+    "layer_0_marginal",
+    "layer_0_cumulative",
+]
+
+COST_BASE_FEATURES: List[str] = ACCEPT_FEATURES.copy()
+
+COST_PARENT_FEATURES: List[str] = [
+    "parent_total_marginal",
+    "parent_higher_marginal",
+    "parent_layer0_cumulative",
+    "parent_depth",
+]
+
+COST_ALL_FEATURES: List[str] = COST_BASE_FEATURES + COST_PARENT_FEATURES
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if isinstance(value, bool):
+            return float(value)
+        return default
+
+
+class RuntimeGating:
+    """Runtime gating helper that scores nodes with acceptance/cost models."""
+
+    def __init__(
+        self,
+        accept_model: Optional[Any],
+        accept_model_path: Optional[str],
+        cost_model: Optional[Any],
+        cost_model_path: Optional[str],
+        utility_weight: float,
+    ) -> None:
+        self.accept_model = accept_model
+        self.accept_model_path = accept_model_path
+        self.cost_model = cost_model
+        self.cost_model_path = cost_model_path
+        self.utility_weight = float(utility_weight)
+        self.enabled = bool(self.cost_model is not None and self.utility_weight > 0.0)
+        self._turn_stats: Optional[Dict[str, Any]] = None
+
+    def start_turn(self) -> None:
+        if not self.enabled:
+            self._turn_stats = None
+            return
+        self._turn_stats = {
+            "iterations": 0,
+            "nodes_total": 0,
+            "nodes_pruned": 0,
+            "nodes_kept": 0,
+            "paths_total": 0,
+            "paths_pruned": 0,
+            "paths_kept": 0,
+            "fallback_used": 0,
+        }
+
+    def record_iteration(self, summary: Dict[str, Any]) -> None:
+        if self._turn_stats is None:
+            return
+        self._turn_stats["iterations"] += 1
+        self._turn_stats["nodes_total"] += summary.get("nodes_total", 0)
+        self._turn_stats["nodes_pruned"] += summary.get("nodes_pruned", 0)
+        self._turn_stats["nodes_kept"] += summary.get("nodes_kept", 0)
+        self._turn_stats["paths_total"] += summary.get("paths_total", 0)
+        self._turn_stats["paths_pruned"] += summary.get("paths_pruned", 0)
+        self._turn_stats["paths_kept"] += summary.get("paths_kept", 0)
+        self._turn_stats["fallback_used"] += summary.get("fallback_used", 0)
+
+    def finish_turn(self) -> Optional[Dict[str, Any]]:
+        if self._turn_stats is None:
+            return None
+        summary = dict(self._turn_stats)
+        summary["config"] = self.summary()
+        self._turn_stats = None
+        return summary
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "accept_model_path": self.accept_model_path,
+            "cost_model_path": self.cost_model_path,
+            "utility_weight": self.utility_weight,
+        }
+
+    @staticmethod
+    def _feature_vector(names: List[str], node: Dict[str, Any]) -> List[float]:
+        values: List[float] = []
+        for name in names:
+            val = _coerce_float(node.get(name), 0.0)
+            if math.isnan(val):
+                val = 0.0
+            values.append(val)
+        return values
+
+    def _score_nodes(
+        self,
+        node_table: List[Dict[str, Any]],
+        root_index: int = 0,
+    ) -> Tuple[List[bool], Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        num_nodes = len(node_table)
+        keep_mask: List[bool] = [False] * num_nodes
+        node_info: Dict[str, Dict[str, Any]] = {}
+
+        if num_nodes == 0:
+            return keep_mask, node_info, {"nodes_total": 0, "nodes_pruned": 0, "nodes_kept": 0}
+
+        accept_nodes: List[int] = []
+        accept_records: List[List[float]] = []
+        cost_nodes: List[int] = []
+        cost_records: List[List[float]] = []
+
+        for entry in node_table:
+            node_idx = int(entry["node"])
+            if node_idx == root_index:
+                keep_mask[node_idx] = True
+                node_info[str(node_idx)] = {
+                    "accept_score": 1.0,
+                    "cost_score": 0.0,
+                    "effective_cost": 0.0,
+                    "utility": 1.0,
+                    "decision": "force_keep",
+                }
+                continue
+            if self.accept_model is not None:
+                accept_records.append(self._feature_vector(ACCEPT_FEATURES, entry))
+                accept_nodes.append(node_idx)
+            if self.cost_model is not None:
+                base_feats = self._feature_vector(COST_BASE_FEATURES, entry)
+                parent_feats = self._feature_vector(COST_PARENT_FEATURES, entry)
+                cost_records.append(base_feats + parent_feats)
+                cost_nodes.append(node_idx)
+
+        accept_scores: Dict[int, float] = {}
+        if self.accept_model is not None and accept_nodes:
+            X_accept = pd.DataFrame(accept_records, columns=ACCEPT_FEATURES)
+            with np.errstate(all="ignore"):
+                probs = self.accept_model.predict_proba(X_accept)[:, 1]
+            for idx, score in zip(accept_nodes, probs):
+                accept_scores[idx] = float(score)
+
+        cost_scores: Dict[int, float] = {}
+        if self.cost_model is not None and cost_nodes:
+            X_cost = pd.DataFrame(cost_records, columns=COST_ALL_FEATURES)
+            with np.errstate(all="ignore"):
+                preds = self.cost_model.predict(X_cost)
+            for idx, cost_val in zip(cost_nodes, preds):
+                cost_scores[idx] = float(cost_val)
+
+        nodes_pruned = 0
+        nodes_kept = 0
+        total_evaluable = max(0, num_nodes - 1)
+
+        for entry in node_table:
+            node_idx = int(entry["node"])
+            if node_idx == root_index:
+                continue
+
+            accept_score = accept_scores.get(node_idx, 1.0) if self.accept_model is not None else 1.0
+            marginal_cost = max(cost_scores.get(node_idx, 0.0), 0.0)
+            effective_cost = marginal_cost
+            utility = accept_score - self.utility_weight * effective_cost
+            decision = "kept" if utility >= 0.0 else "pruned"
+            keep_mask[node_idx] = utility >= 0.0
+
+            if keep_mask[node_idx]:
+                nodes_kept += 1
+            else:
+                nodes_pruned += 1
+
+            node_info[str(node_idx)] = {
+                "accept_score": accept_score,
+                "cost_score": marginal_cost,
+                "effective_cost": effective_cost,
+                "utility": utility,
+                "decision": decision,
+            }
+
+        summary = {
+            "nodes_total": total_evaluable,
+            "nodes_pruned": nodes_pruned,
+            "nodes_kept": nodes_kept,
+        }
+
+        return keep_mask, node_info, summary
+
+    def _filter_paths(
+        self,
+        retrieve_indices: torch.Tensor,
+        keep_mask: List[bool],
+    ) -> Tuple[torch.Tensor, Dict[str, Any], torch.Tensor]:
+        if retrieve_indices.numel() == 0:
+            width = retrieve_indices.size(1) if retrieve_indices.dim() > 1 else 1
+            fallback = torch.full((1, width), -1, dtype=torch.long, device=retrieve_indices.device)
+            fallback[0, 0] = 0
+            kept_rows = torch.tensor([0], dtype=torch.long, device=retrieve_indices.device)
+            return fallback, {"paths_total": 0, "paths_kept": 1, "paths_pruned": 0, "fallback_used": 1}, kept_rows
+
+        retrieve_cpu = retrieve_indices.detach().to("cpu")
+        kept_rows: List[int] = []
+        for row_idx in range(retrieve_cpu.size(0)):
+            nodes = [int(val) for val in retrieve_cpu[row_idx].tolist() if val >= 0]
+            if all(keep_mask[node] for node in nodes):
+                kept_rows.append(row_idx)
+
+        fallback_used = 0
+        if kept_rows:
+            kept_tensor = torch.tensor(kept_rows, dtype=torch.long)
+            filtered_cpu = retrieve_cpu.index_select(0, kept_tensor)
+        else:
+            filtered_cpu = torch.full((1, retrieve_cpu.size(1)), -1, dtype=torch.long)
+            filtered_cpu[0, 0] = 0
+            fallback_used = 1
+            kept_tensor = torch.tensor([0], dtype=torch.long)
+
+        filtered = filtered_cpu.to(retrieve_indices.device)
+        paths_total = retrieve_cpu.size(0)
+        paths_kept = filtered_cpu.size(0)
+        summary = {
+            "paths_total": paths_total,
+            "paths_kept": paths_kept,
+            "fallback_used": fallback_used,
+        }
+        return filtered, summary, kept_tensor.to(retrieve_indices.device)
+
+    def apply(
+        self,
+        node_table: List[Dict[str, Any]],
+        retrieve_indices: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], Optional[List[bool]], torch.Tensor]:
+        if not self.enabled:
+            kept_rows = torch.arange(
+                retrieve_indices.size(0), device=retrieve_indices.device, dtype=torch.long
+            ) if retrieve_indices.dim() > 0 else torch.tensor([], dtype=torch.long, device=retrieve_indices.device)
+            return retrieve_indices, None, None, kept_rows
+
+        keep_mask, node_info, node_summary = self._score_nodes(node_table)
+        filtered_indices, path_summary, kept_rows = self._filter_paths(retrieve_indices, keep_mask)
+
+        summary = {**node_summary, **path_summary}
+        self.record_iteration(summary)
+
+        gating_payload = {
+            "config": self.summary(),
+            "summary": summary,
+            "nodes": node_info,
+        }
+        return filtered_indices, gating_payload, keep_mask, kept_rows
+
+
+class OracleTracePruner:
+    """Replay oracle traces to prune draft trees with perfect knowledge."""
+
+    def __init__(
+        self,
+        trace_map: Dict[Tuple[str, int], List[List[int]]],
+        source: Optional[str] = None,
+        strict: bool = False,
+    ) -> None:
+        self.trace_map = trace_map
+        self.source = source
+        self.strict = bool(strict)
+        self.active: bool = False
+        self.current_key: Optional[Tuple[str, int]] = None
+        self.current_iterations: List[Dict[str, Any]] = []
+        self.cursor: int = 0
+        self.current_turn_stats: Dict[str, Any] = {}
+        self.current_iteration_summaries: List[Dict[str, Any]] = []
+
+    @classmethod
+    def from_trace_file(
+        cls,
+        path: str,
+        choice_index: int = 0,
+        strict: bool = False,
+    ) -> "OracleTracePruner":
+        trace_map: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+        with open(path, "r") as f:
+            raw_content = f.read()
+
+        records: List[Dict[str, Any]] = []
+        try:
+            parsed = json.loads(raw_content)
+            if isinstance(parsed, list):
+                records = [item for item in parsed if isinstance(item, dict)]
+            elif isinstance(parsed, dict):
+                records = [parsed]
+        except json.JSONDecodeError:
+            for line in raw_content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+
+        for record in records:
+            question_id = record.get("question_id")
+            key_prefix = str(question_id)
+            choices = record.get("choices", [])
+            if not choices:
+                continue
+            if not (0 <= choice_index < len(choices)):
+                continue
+            choice = choices[choice_index]
+            stats = choice.get("stats") or []
+            for turn_idx, stat in enumerate(stats):
+                traces = stat.get("expert_traces") or []
+                if not traces:
+                    continue
+                turn_key = (key_prefix, int(turn_idx))
+                accepted_sequences: List[Dict[str, Any]] = []
+                for trace in traces:
+                    nodes = trace.get("accepted_nodes") or []
+                    cleaned: List[int] = []
+                    for node in nodes:
+                        if isinstance(node, int):
+                            cleaned.append(node)
+                        else:
+                            try:
+                                cleaned.append(int(node))
+                            except (TypeError, ValueError):
+                                continue
+                    tokens = trace.get("tokens") or []
+                    token_path: List[int] = []
+                    for node_idx in cleaned:
+                        if 0 <= node_idx < len(tokens):
+                            token_path.append(int(tokens[node_idx]))
+                        else:
+                            token_path.append(-1)
+                    accepted_sequences.append({"nodes": cleaned, "tokens": token_path})
+                if accepted_sequences:
+                    trace_map[turn_key] = accepted_sequences
+        return cls(trace_map=trace_map, source=path, strict=strict)
+
+    def has_trace_for(self, question_id: Any, turn_index: int) -> bool:
+        key = (str(question_id), int(turn_index))
+        return key in self.trace_map
+
+    def start_turn(self, question_id: Any, turn_index: int) -> bool:
+        key = (str(question_id), int(turn_index))
+        self.current_key = key
+        self.current_iterations = [dict(seq) for seq in self.trace_map.get(key, [])]
+        self.cursor = 0
+        self.active = bool(self.current_iterations)
+        self.current_iteration_summaries = []
+        self.current_turn_stats = {
+            "question_id": question_id,
+            "turn_index": int(turn_index),
+            "expected_iterations": len(self.current_iterations),
+            "applied_iterations": 0,
+            "missing_iterations": 0,
+            "fallback_iterations": 0,
+            "paths_total": 0,
+            "paths_kept": 0,
+            "source": self.source,
+        }
+        if not self.active and self.strict:
+            raise KeyError(
+                f"No oracle trace available for question={question_id!r}, turn={turn_index}"
+            )
+        return self.active
+
+    def finish_turn(self) -> Optional[Dict[str, Any]]:
+        if not self.current_turn_stats:
+            self.active = False
+            self.current_key = None
+            self.current_iterations = []
+            self.cursor = 0
+            return None
+
+        expected = self.current_turn_stats.get("expected_iterations", 0)
+        applied = self.current_turn_stats.get("applied_iterations", 0)
+        missing = self.current_turn_stats.get("missing_iterations", 0)
+        self.current_turn_stats["unused_iterations"] = max(expected - applied, 0)
+        self.current_turn_stats["status"] = (
+            "ok" if applied == expected and missing == 0 else "partial"
+        )
+        summary = dict(self.current_turn_stats)
+
+        if self.strict and summary["status"] != "ok":
+            raise RuntimeError(
+                f"Oracle trace replay incomplete for key={self.current_key}, "
+                f"summary={summary}"
+            )
+
+        self.active = False
+        self.current_key = None
+        self.current_iterations = []
+        self.cursor = 0
+        self.current_iteration_summaries = []
+        self.current_turn_stats = {}
+        return summary
+
+    def apply(
+        self,
+        iteration_index: int,
+        retrieve_indices: torch.Tensor,
+        parents: List[int],
+        tokens: List[int],
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], Optional[List[bool]], Optional[torch.Tensor]]:
+        if not self.active:
+            return retrieve_indices, None, None, None
+
+        summary: Dict[str, Any] = {
+            "iteration": int(iteration_index),
+            "status": "ok",
+        }
+
+        if self.cursor >= len(self.current_iterations):
+            summary["status"] = "exhausted"
+            summary["paths_total"] = int(retrieve_indices.size(0)) if retrieve_indices.dim() > 0 else 0
+            summary["paths_kept"] = summary["paths_total"]
+            summary["fallback_used"] = 0
+            self.current_turn_stats["missing_iterations"] += 1
+            self.current_iteration_summaries.append(summary)
+            return retrieve_indices, summary, None, None
+
+        expected_record = self.current_iterations[self.cursor]
+        self.cursor += 1
+        self.current_turn_stats["applied_iterations"] += 1
+
+        num_nodes = len(parents)
+        expected_nodes_raw = [int(node) for node in expected_record.get("nodes", [])]
+        expected_tokens = [int(tok) for tok in expected_record.get("tokens", [])]
+        summary["expected_nodes"] = expected_nodes_raw
+        summary["expected_tokens"] = expected_tokens
+
+        if not expected_tokens:
+            raise RuntimeError("Oracle replay: expected token path is empty")
+
+        retrieve_cpu = retrieve_indices.detach().to("cpu")
+        tokens_len = len(expected_tokens)
+        matched_nodes: Optional[List[int]] = None
+        matched_row: Optional[int] = None
+
+        if tokens is None or len(tokens) == 0:
+            raise RuntimeError("Oracle replay: current tree tokens unavailable")
+
+        for row_idx in range(retrieve_cpu.size(0)):
+            nodes = [int(val) for val in retrieve_cpu[row_idx].tolist() if val >= 0]
+            if len(nodes) < tokens_len:
+                continue
+            row_tokens: List[int] = []
+            valid = True
+            for node in nodes[:tokens_len]:
+                if 0 <= node < len(tokens):
+                    row_tokens.append(int(tokens[node]))
+                else:
+                    valid = False
+                    break
+            if not valid:
+                continue
+            if row_tokens == expected_tokens:
+                matched_nodes = nodes[:tokens_len]
+                matched_row = row_idx
+                break
+
+        if matched_nodes is None or matched_row is None:
+            raise RuntimeError(
+                f"Oracle replay: no tree path matches expected tokens {expected_tokens}"
+            )
+
+        keep_mask = [False] * num_nodes
+        for node in matched_nodes:
+            if 0 <= node < num_nodes:
+                keep_mask[node] = True
+        if num_nodes > 0:
+            keep_mask[0] = True
+
+        summary["nodes_kept"] = int(sum(keep_mask))
+        summary["matched_nodes"] = matched_nodes
+        summary["matched_tokens"] = expected_tokens
+        summary["paths_total"] = retrieve_cpu.size(0)
+        summary["paths_kept"] = 1
+        summary["kept_rows"] = [int(matched_row)]
+
+        filtered_indices = retrieve_indices.index_select(
+            0, torch.tensor([matched_row], dtype=torch.long, device=retrieve_indices.device)
+        )
+        kept_rows = torch.tensor([matched_row], dtype=torch.long, device=retrieve_indices.device)
+
+        self.current_turn_stats["paths_total"] += summary.get("paths_total", 0)
+        self.current_turn_stats["paths_kept"] += summary.get("paths_kept", 0)
+        self.current_iteration_summaries.append(summary)
+        return filtered_indices, summary, keep_mask, kept_rows
+
+
+def _prune_tree_to_path(
+    draft_tokens: torch.Tensor,
+    tree_parents: torch.Tensor,
+    tree_position_ids: torch.Tensor,
+    draft_log_probs: torch.Tensor,
+    keep_nodes: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+    """Rebuild draft tree tensors so only the oracle path remains."""
+
+    if not keep_nodes:
+        raise RuntimeError("Oracle replay: keep_nodes is empty")
+
+    device = draft_tokens.device
+    keep_order: List[int] = []
+    seen: set[int] = set()
+    for node in keep_nodes:
+        if node < 0 or node in seen:
+            continue
+        keep_order.append(int(node))
+        seen.add(int(node))
+
+    if not keep_order:
+        raise RuntimeError("Oracle replay: no valid nodes to keep")
+
+    if keep_order[0] != 0:
+        keep_order.insert(0, 0)
+
+    tree_parents_flat = tree_parents.view(-1)
+    depth_flat = tree_position_ids.view(-1)
+    keep_order = sorted(keep_order, key=lambda idx: (int(depth_flat[idx].item()), int(idx)))
+
+    index_map: Dict[int, int] = {old_idx: new_idx for new_idx, old_idx in enumerate(keep_order)}
+    num_nodes = len(keep_order)
+
+    # Remap parents
+    new_parents: List[int] = []
+    for old_idx in keep_order:
+        parent = int(tree_parents_flat[old_idx].item())
+        if parent < 0:
+            new_parents.append(-1)
+        elif parent in index_map:
+            new_parents.append(index_map[parent])
+        else:
+            raise RuntimeError(
+                f"Oracle replay: parent node {parent} missing from keep set {keep_nodes}"
+            )
+
+    # Compute new depths and validate structure
+    new_depths: List[int] = []
+    for idx, parent in enumerate(new_parents):
+        if parent < 0:
+            new_depths.append(0)
+        else:
+            new_depths.append(new_depths[parent] + 1)
+
+    depth_to_node: Dict[int, int] = {}
+    for node_idx, depth in enumerate(new_depths):
+        if depth in depth_to_node:
+            raise RuntimeError(
+                f"Oracle replay: multiple nodes share depth {depth} in path {keep_order}"
+            )
+        depth_to_node[depth] = node_idx
+
+    max_depth = max(new_depths)
+    expected_depths = set(range(max_depth + 1))
+    if set(depth_to_node.keys()) != expected_depths:
+        raise RuntimeError(
+            f"Oracle replay: depth coverage mismatch (expected {expected_depths}, got {set(depth_to_node.keys())})"
+        )
+
+    index_tensor = torch.tensor(keep_order, dtype=torch.long, device=device)
+    new_draft_tokens = draft_tokens.index_select(1, index_tensor)
+    new_draft_log_probs = draft_log_probs.index_select(0, index_tensor)
+
+    new_parents_tensor = torch.tensor(new_parents, dtype=tree_parents.dtype, device=device)
+    new_depths_tensor = torch.tensor(new_depths, dtype=tree_position_ids.dtype, device=device)
+
+    mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool, device=device)
+    for idx in range(num_nodes):
+        current = idx
+        while current >= 0:
+            mask[idx, current] = True
+            current = new_parents[current]
+
+    new_tree_mask = mask.float()[None, None]
+    new_tree_position_ids = new_depths_tensor.unsqueeze(0)
+
+    retrieve_row = torch.full((max_depth + 1,), -1, dtype=torch.long, device=device)
+    for depth in range(max_depth + 1):
+        retrieve_row[depth] = depth_to_node[depth]
+    new_retrieve_indices = retrieve_row.unsqueeze(0)
+
+    return (
+        new_draft_tokens,
+        new_tree_mask,
+        new_tree_position_ids,
+        new_parents_tensor,
+        new_draft_log_probs,
+        new_retrieve_indices,
+        new_depths,
+        keep_order,
+    )
+
+
 def set_expert_trace_recorder(model: nn.Module, collector: Optional[ExpertTraceCollector]) -> int:
     """Attach or clear expert trace recorders across all supported MoE blocks."""
 
@@ -53,18 +679,6 @@ def set_expert_trace_recorder(model: nn.Module, collector: Optional[ExpertTraceC
         setter = getattr(module, "set_trace_recorder", None)
         if callable(setter):
             setter(recorder)
-            updated += 1
-    return updated
-
-
-def set_token_routing_weights(model: nn.Module, weights: Optional[torch.Tensor]) -> int:
-    """Propagate per-token routing weights to all MoE blocks."""
-
-    updated = 0
-    for module in model.modules():
-        setter = getattr(module, "set_token_routing_weights", None)
-        if callable(setter):
-            setter(weights)
             updated += 1
     return updated
 
@@ -195,6 +809,472 @@ def summarize_layer_experts(
     }
 
 
+def _compute_children(parents: List[int], num_nodes: int) -> List[List[int]]:
+    children: List[List[int]] = [[] for _ in range(num_nodes)]
+    for node_idx, parent_idx in enumerate(parents):
+        if 0 <= parent_idx < num_nodes:
+            children[parent_idx].append(node_idx)
+    return children
+
+
+def _compute_subtree_sizes(children: List[List[int]], traversal: List[int]) -> List[int]:
+    sizes = [1] * len(children)
+    for node_idx in traversal:
+        for child_idx in children[node_idx]:
+            sizes[node_idx] += sizes[child_idx]
+    return sizes
+
+
+def _normalize_int_lists(payload: Any, num_nodes: int) -> List[List[int]]:
+    values = payload or []
+    if (
+        isinstance(values, list)
+        and len(values) == 1
+        and isinstance(values[0], list)
+        and len(values[0]) == num_nodes
+    ):
+        values = values[0]
+    result: List[List[int]] = []
+    for idx in range(num_nodes):
+        if isinstance(values, list) and idx < len(values) and isinstance(values[idx], list):
+            entry = [
+                int(v)
+                for v in values[idx]
+                if isinstance(v, (int, float))
+            ]
+            result.append(entry)
+        else:
+            result.append([])
+    return result
+
+
+def _normalize_float_lists(payload: Any, num_nodes: int) -> List[List[float]]:
+    values = payload or []
+    if (
+        isinstance(values, list)
+        and len(values) == 1
+        and isinstance(values[0], list)
+        and len(values[0]) == num_nodes
+    ):
+        values = values[0]
+    result: List[List[float]] = []
+    for idx in range(num_nodes):
+        if isinstance(values, list) and idx < len(values) and isinstance(values[idx], list):
+            entry = [
+                float(v)
+                for v in values[idx]
+                if isinstance(v, (int, float))
+            ]
+            result.append(entry)
+        else:
+            result.append([])
+    return result
+
+
+def _compute_layer0_stats(
+    collector: Optional["ExpertTraceCollector"],
+    num_nodes: int,
+) -> Dict[str, Any]:
+    experts_per_node = [[] for _ in range(num_nodes)]
+    routing_weights = [math.nan] * num_nodes
+    if collector is None:
+        return {
+            "experts": experts_per_node,
+            "routing_weights": routing_weights,
+        }
+    layer_record = collector.records.get(0) if hasattr(collector, "records") else None
+    if layer_record is None:
+        return {
+            "experts": experts_per_node,
+            "routing_weights": routing_weights,
+        }
+    experts_per_node = _normalize_int_lists(layer_record.get("experts"), num_nodes)
+    weight_lists = _normalize_float_lists(layer_record.get("weights"), num_nodes)
+    routing_weights = [
+        float(sum(weights)) if weights else math.nan
+        for weights in weight_lists
+    ]
+    return {
+        "experts": experts_per_node,
+        "routing_weights": routing_weights,
+    }
+
+
+def _build_training_iteration_trace(
+    iteration_index: int,
+    parents: List[int],
+    depths: List[int],
+    tokens: List[int],
+    accepted_path: List[int],
+    depth_hist: List[int],
+    tree_depth: int,
+    subtree_weights_payload: Optional[List[Any]],
+    node_log_probs: Dict[str, float],
+    draft_log_probs: Dict[str, float],
+    collector: Optional["ExpertTraceCollector"],
+) -> Dict[str, Any]:
+    num_nodes = len(parents)
+    accepted_nodes = [node for node in accepted_path if node >= 0]
+    accepted_set = set(accepted_nodes)
+    accepted_order = {node: idx for idx, node in enumerate(accepted_nodes)}
+
+    # Tree structure helpers
+    children = _compute_children(parents, num_nodes)
+    reverse_order = sorted(range(num_nodes), key=lambda idx: depths[idx], reverse=True)
+    subtree_sizes = _compute_subtree_sizes(children, reverse_order)
+
+    # Layer-0 routing features
+    layer0_stats = _compute_layer0_stats(collector, num_nodes)
+    layer0_expert_lists: List[List[int]] = layer0_stats["experts"]
+    routing_weight_sums: List[float] = layer0_stats["routing_weights"]
+
+    layer0_sets = [set(node_experts) for node_experts in layer0_expert_lists]
+
+    # Gather per-layer expert sets (layer 0 plus higher layers)
+    layer_node_sets: Dict[int, List[set[int]]] = {0: layer0_sets}
+    if collector is not None:
+        for layer_idx, layer_record in collector.records.items():
+            if layer_idx == 0:
+                continue
+            expert_lists = _normalize_int_lists(layer_record.get("experts"), num_nodes)
+            layer_node_sets[layer_idx] = [set(items) for items in expert_lists]
+
+    node_order = sorted(range(num_nodes), key=lambda idx: depths[idx])
+    layer_cumulative_sets: Dict[int, List[set[int]]] = {
+        layer_idx: [set() for _ in range(num_nodes)]
+        for layer_idx in layer_node_sets
+    }
+    layer_marginal_counts: Dict[int, List[int]] = {
+        layer_idx: [0] * num_nodes
+        for layer_idx in layer_node_sets
+    }
+    layer_cumulative_counts: Dict[int, List[int]] = {
+        layer_idx: [0] * num_nodes
+        for layer_idx in layer_node_sets
+    }
+    layer0_set_strings: List[str] = [""] * num_nodes
+    wave_layer_unique_sets: Dict[int, set[int]] = {layer_idx: set() for layer_idx in layer_node_sets}
+
+    for node_idx in node_order:
+        parent_idx = parents[node_idx]
+        for layer_idx, node_sets in layer_node_sets.items():
+            node_set = node_sets[node_idx]
+            if 0 <= parent_idx < num_nodes:
+                parent_set = layer_cumulative_sets[layer_idx][parent_idx]
+            else:
+                parent_set = set()
+            marginal = node_set - parent_set
+            cumulative = parent_set.union(node_set)
+            layer_cumulative_sets[layer_idx][node_idx] = cumulative
+            layer_marginal_counts[layer_idx][node_idx] = len(marginal)
+            layer_cumulative_counts[layer_idx][node_idx] = len(cumulative)
+            if layer_idx == 0:
+                layer0_set_strings[node_idx] = " ".join(str(e) for e in sorted(node_set)) if node_set else ""
+            wave_layer_unique_sets[layer_idx].update(node_set)
+
+    layer0_marginal = layer_marginal_counts.get(0, [0] * num_nodes)
+    layer0_cumulative = layer_cumulative_counts.get(0, [0] * num_nodes)
+    layer0_unique = [len(s) for s in layer_node_sets.get(0, [set() for _ in range(num_nodes)])]
+
+    total_marginal: List[int] = [0] * num_nodes
+    for layer_idx, counts in layer_marginal_counts.items():
+        for node_idx, value in enumerate(counts):
+            total_marginal[node_idx] += value
+
+    higher_marginal: List[int] = [total_marginal[idx] - layer0_marginal[idx] for idx in range(num_nodes)]
+
+    layer_unique_totals: Dict[int, int] = {layer_idx: len(expert_set) for layer_idx, expert_set in wave_layer_unique_sets.items()}
+    wave_total_unique = sum(layer_unique_totals.values())
+    wave_layer0_unique = layer_unique_totals.get(0, 0)
+    wave_higher_unique = max(wave_total_unique - wave_layer0_unique, 0)
+
+    # Subtree weights
+    if isinstance(subtree_weights_payload, list) and subtree_weights_payload and isinstance(subtree_weights_payload[0], list):
+        subtree_weights = subtree_weights_payload[0]
+    else:
+        subtree_weights = subtree_weights_payload or []
+    if len(subtree_weights) < num_nodes:
+        subtree_weights = subtree_weights + [math.nan] * (num_nodes - len(subtree_weights))
+    else:
+        subtree_weights = subtree_weights[:num_nodes]
+
+    # Ensure token list matches node count
+    if len(tokens) < num_nodes:
+        tokens = tokens + [None] * (num_nodes - len(tokens))
+    else:
+        tokens = tokens[:num_nodes]
+
+    accepted_length = len(accepted_set)
+    accepted_layer_sets: Dict[int, set[int]] = {layer_idx: set() for layer_idx in layer_node_sets}
+    for node_idx in accepted_set:
+        if node_idx < num_nodes:
+            for layer_idx, node_sets in layer_node_sets.items():
+                if node_idx < len(node_sets):
+                    accepted_layer_sets[layer_idx].update(node_sets[node_idx])
+
+    layer_accepted_totals: Dict[int, int] = {
+        layer_idx: len(expert_set) for layer_idx, expert_set in accepted_layer_sets.items()
+    }
+    wave_accepted_unique = sum(layer_accepted_totals.values())
+
+    node_rows: List[Dict[str, Any]] = []
+    for node_idx in range(num_nodes):
+        depth_val = depths[node_idx] if node_idx < len(depths) else -1
+        width_at_depth = depth_hist[depth_val] if 0 <= depth_val < len(depth_hist) else math.nan
+        early_sum = 0
+        late_sum = 0
+        row = {
+            "node": node_idx,
+            "parent": parents[node_idx],
+            "depth": depth_val,
+            "token_id": tokens[node_idx],
+            "accepted": 1 if node_idx in accepted_set else 0,
+            "accepted_order": accepted_order.get(node_idx, -1),
+            "children_count": len(children[node_idx]),
+            "is_leaf": 1 if not children[node_idx] else 0,
+            "is_root": 1 if parents[node_idx] < 0 else 0,
+            "subtree_size": subtree_sizes[node_idx],
+            "tree_total_nodes": num_nodes,
+            "tree_depth": tree_depth,
+            "tree_width_at_depth": width_at_depth,
+            "routing_weight": routing_weight_sums[node_idx] if node_idx < len(routing_weight_sums) else math.nan,
+            "subtree_weight": subtree_weights[node_idx] if node_idx < len(subtree_weights) else math.nan,
+            "draft_log_prob": float(draft_log_probs.get(str(node_idx), math.nan)),
+            "layer_0_marginal": layer0_marginal[node_idx],
+            "layer_0_cumulative": layer0_cumulative[node_idx],
+            "layer0_set": layer0_set_strings[node_idx],
+            "layer0_unique": layer0_unique[node_idx],
+            "total_marginal": total_marginal[node_idx],
+            "higher_marginal": higher_marginal[node_idx],
+        }
+        for layer_idx, counts in layer_marginal_counts.items():
+            count_val = counts[node_idx]
+            row[f"layer_{layer_idx}_marginal"] = count_val
+            row[f"layer_{layer_idx}_cumulative"] = layer_cumulative_counts[layer_idx][node_idx]
+            if layer_idx <= 2:
+                early_sum += count_val
+            if layer_idx >= 12:
+                late_sum += count_val
+        row["early_marginal"] = early_sum
+        row["late_marginal"] = late_sum
+        row["wave_total_unique"] = wave_total_unique
+        row["wave_layer0_unique"] = wave_layer0_unique
+        row["wave_higher_unique"] = wave_higher_unique
+        row["wave_accepted_unique"] = wave_accepted_unique
+        for layer_idx, total_val in layer_unique_totals.items():
+            row[f"wave_layer_{layer_idx}_total_unique"] = total_val
+        for layer_idx, accepted_val in layer_accepted_totals.items():
+            row[f"wave_layer_{layer_idx}_accepted_unique"] = accepted_val
+        node_rows.append(row)
+
+    return {
+        "schema": "training",
+        "iteration": iteration_index,
+        "tree_stats": {
+            "total_nodes": num_nodes,
+            "depth": tree_depth,
+            "width_by_depth": depth_hist,
+        },
+        "post_verify": {
+            "accepted_nodes": accepted_nodes,
+            "accepted_length": accepted_length,
+            "node_log_probs": node_log_probs,
+        },
+        "node_features": node_rows,
+    }
+
+
+def _build_gating_node_table(
+    parents: List[int],
+    depths: List[int],
+    tokens: List[int],
+    depth_hist: List[int],
+    tree_depth: int,
+    subtree_weights_payload: Optional[List[Any]],
+    draft_log_probs: List[float],
+    collector: Optional["ExpertTraceCollector"],
+) -> List[Dict[str, Any]]:
+    num_nodes = len(parents)
+    children = _compute_children(parents, num_nodes)
+    reverse_order = sorted(range(num_nodes), key=lambda idx: depths[idx], reverse=True)
+    subtree_sizes = _compute_subtree_sizes(children, reverse_order)
+
+    layer0_stats = _compute_layer0_stats(collector, num_nodes)
+    layer0_lists = layer0_stats["experts"]
+    layer0_sets = [set(items) for items in layer0_lists]
+    routing_weights = layer0_stats["routing_weights"]
+
+    layer_node_sets: Dict[int, List[set[int]]] = {0: layer0_sets}
+    if collector is not None:
+        for layer_idx, layer_record in collector.records.items():
+            if layer_idx == 0:
+                continue
+            expert_lists = _normalize_int_lists(layer_record.get("experts"), num_nodes)
+            layer_node_sets[layer_idx] = [set(items) for items in expert_lists]
+
+    layer_cumulative_sets: Dict[int, List[set[int]]] = {
+        layer_idx: [set() for _ in range(num_nodes)]
+        for layer_idx in layer_node_sets
+    }
+    layer_marginal_counts: Dict[int, List[int]] = {
+        layer_idx: [0] * num_nodes for layer_idx in layer_node_sets
+    }
+    layer_cumulative_counts: Dict[int, List[int]] = {
+        layer_idx: [0] * num_nodes for layer_idx in layer_node_sets
+    }
+
+    node_order = sorted(range(num_nodes), key=lambda idx: depths[idx])
+    for node_idx in node_order:
+        parent_idx = parents[node_idx]
+        for layer_idx, node_sets in layer_node_sets.items():
+            node_set = node_sets[node_idx]
+            parent_set = layer_cumulative_sets[layer_idx][parent_idx] if parent_idx >= 0 else set()
+            marginal = node_set - parent_set
+            cumulative = parent_set.union(node_set)
+            layer_cumulative_sets[layer_idx][node_idx] = cumulative
+            layer_marginal_counts[layer_idx][node_idx] = len(marginal)
+            layer_cumulative_counts[layer_idx][node_idx] = len(cumulative)
+
+    layer0_marginal = layer_marginal_counts.get(0, [0] * num_nodes)
+    layer0_cumulative = layer_cumulative_counts.get(0, [0] * num_nodes)
+    layer0_unique = [len(layer_node_sets.get(0, [set() for _ in range(num_nodes)])[idx]) for idx in range(num_nodes)]
+
+    total_marginal = [0] * num_nodes
+    for counts in layer_marginal_counts.values():
+        for idx, value in enumerate(counts):
+            total_marginal[idx] += value
+    higher_marginal = [total_marginal[idx] - layer0_marginal[idx] for idx in range(num_nodes)]
+
+    if isinstance(subtree_weights_payload, list) and subtree_weights_payload and isinstance(subtree_weights_payload[0], list):
+        subtree_weights = subtree_weights_payload[0]
+    else:
+        subtree_weights = subtree_weights_payload or []
+    if len(subtree_weights) < num_nodes:
+        subtree_weights = subtree_weights + [0.0] * (num_nodes - len(subtree_weights))
+    else:
+        subtree_weights = subtree_weights[:num_nodes]
+
+    if len(tokens) < num_nodes:
+        tokens = tokens + [None] * (num_nodes - len(tokens))
+    else:
+        tokens = tokens[:num_nodes]
+
+    if len(draft_log_probs) < num_nodes:
+        draft_log_probs = draft_log_probs + [0.0] * (num_nodes - len(draft_log_probs))
+    else:
+        draft_log_probs = draft_log_probs[:num_nodes]
+
+    node_table: List[Dict[str, Any]] = []
+    tree_total_nodes = num_nodes
+    for node_idx in range(num_nodes):
+        parent_idx = parents[node_idx]
+        depth_val = depths[node_idx] if node_idx < len(depths) else 0
+        width_val = depth_hist[depth_val] if 0 <= depth_val < len(depth_hist) else 0
+        routing_weight = float(routing_weights[node_idx]) if node_idx < len(routing_weights) else 0.0
+        subtree_weight = float(subtree_weights[node_idx]) if node_idx < len(subtree_weights) else 0.0
+        layer0_unique_val = layer0_unique[node_idx]
+        layer0_marginal_val = layer0_marginal[node_idx]
+        layer0_cumulative_val = layer0_cumulative[node_idx]
+        total_marginal_val = total_marginal[node_idx]
+        higher_marginal_val = higher_marginal[node_idx]
+
+        parent_total = total_marginal[parent_idx] if parent_idx >= 0 else 0.0
+        parent_higher = higher_marginal[parent_idx] if parent_idx >= 0 else 0.0
+        parent_layer0_cumulative = layer0_cumulative[parent_idx] if parent_idx >= 0 else 0.0
+        parent_depth = depths[parent_idx] if parent_idx >= 0 else 0.0
+
+        entry = {
+            "node": node_idx,
+            "parent": parent_idx,
+            "depth": depth_val,
+            "children_count": len(children[node_idx]),
+            "is_leaf": 1 if not children[node_idx] else 0,
+            "is_root": 1 if parent_idx < 0 else 0,
+            "subtree_size": subtree_sizes[node_idx],
+            "tree_total_nodes": tree_total_nodes,
+            "tree_depth": tree_depth,
+            "tree_width_at_depth": width_val,
+            "draft_log_prob": float(draft_log_probs[node_idx]),
+            "routing_weight": routing_weight,
+            "subtree_weight": subtree_weight,
+            "layer0_unique": layer0_unique_val,
+            "layer_0_marginal": float(layer0_marginal_val),
+            "layer_0_cumulative": float(layer0_cumulative_val),
+            "total_marginal": float(total_marginal_val),
+            "higher_marginal": float(higher_marginal_val),
+            "parent_total_marginal": float(parent_total),
+            "parent_higher_marginal": float(parent_higher),
+            "parent_layer0_cumulative": float(parent_layer0_cumulative),
+            "parent_depth": float(parent_depth),
+            "token_id": tokens[node_idx],
+        }
+        node_table.append(entry)
+
+    return node_table
+
+
+def _build_analysis_iteration_trace(
+    iteration_index: int,
+    tokens: List[int],
+    parents: List[int],
+    depths: List[int],
+    retrieve_indices: List[List[int]],
+    accepted_path: List[int],
+    tree_depth: int,
+    depth_hist: List[int],
+    total_nodes: int,
+    accepted_length: int,
+    collector: Optional["ExpertTraceCollector"],
+    subtree_weights_cpu: Optional[List[Any]],
+    verification_info: Dict[str, Any],
+    node_log_probs: Dict[str, float],
+    draft_log_probs_dict: Dict[str, float],
+) -> Dict[str, Any]:
+    accepted_nodes_set = {n for n in accepted_path if n >= 0}
+    accepted_experts_summary: Dict[str, Any] = {}
+    layer_expert_stats: Dict[str, Any] = {}
+    combined_total_unique = 0
+    combined_accepted_unique = 0
+    node_depths_list = depths
+    if collector is not None:
+        for layer_idx, layer_record in collector.records.items():
+            stats = summarize_layer_experts(layer_record, node_depths_list, accepted_nodes_set)
+            layer_key = str(layer_idx)
+            layer_expert_stats[layer_key] = stats
+            accepted_experts_summary[layer_key] = {
+                "unique_count": stats["accepted_unique"],
+                "experts": stats["accepted_unique_ids"],
+            }
+            combined_total_unique += stats["total_unique"]
+            combined_accepted_unique += stats["accepted_unique"]
+
+    pruned_nodes = total_nodes - accepted_length
+
+    return {
+        "schema": "analysis",
+        "iteration": iteration_index,
+        "tokens": tokens,
+        "parents": parents,
+        "depth": depths,
+        "retrieve_indices": retrieve_indices,
+        "accepted_nodes": accepted_path,
+        "tree_total_nodes": total_nodes,
+        "tree_depth": tree_depth,
+        "tree_width_by_depth": depth_hist,
+        "accepted_length": accepted_length,
+        "accepted_unique_experts": accepted_experts_summary,
+        "layer_expert_stats": layer_expert_stats,
+        "total_unique_experts": combined_total_unique,
+        "accepted_unique_experts_count": combined_accepted_unique,
+        "pruned_nodes": pruned_nodes,
+        "subtree_weights": subtree_weights_cpu,
+        "verification": verification_info,
+        "node_log_probs": node_log_probs,
+        "draft_node_log_probs": draft_log_probs_dict,
+        "experts": collector.to_serializable() if collector is not None else {},
+    }
+
+
 class EaModel(nn.Module):
 
     def __init__(
@@ -249,6 +1329,8 @@ class EaModel(nn.Module):
         load_=self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
+        self.gating: Optional[RuntimeGating] = None
+        self.oracle: Optional[OracleTracePruner] = None
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -350,6 +1432,89 @@ class EaModel(nn.Module):
 
         return model
 
+    def configure_gating(
+            self,
+            accept_model_path: Optional[str] = None,
+            cost_model_path: Optional[str] = None,
+            utility_weight: float = 0.0,
+    ) -> None:
+        accept_model = None
+        if accept_model_path:
+            try:
+                accept_model = joblib.load(accept_model_path)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load acceptance model from '{accept_model_path}'.") from exc
+
+        cost_model = None
+        if cost_model_path:
+            try:
+                cost_model = joblib.load(cost_model_path)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load cost model from '{cost_model_path}'.") from exc
+
+        gating = RuntimeGating(
+            accept_model=accept_model,
+            accept_model_path=accept_model_path,
+            cost_model=cost_model,
+            cost_model_path=cost_model_path,
+            utility_weight=float(utility_weight),
+        )
+
+        if not gating.enabled:
+            self.gating = None
+            return
+        self.gating = gating
+
+    def configure_oracle(
+            self,
+            trace_file: Optional[str] = None,
+            choice_index: int = 0,
+            strict: bool = False,
+    ) -> bool:
+        if trace_file is None:
+            self.oracle = None
+            return False
+        if not os.path.exists(trace_file):
+            raise FileNotFoundError(f"Oracle trace file not found: {trace_file}")
+        pruner = OracleTracePruner.from_trace_file(
+            path=trace_file,
+            choice_index=choice_index,
+            strict=strict,
+        )
+        if not pruner.trace_map and strict:
+            raise ValueError(f"No oracle traces loaded from {trace_file}")
+        self.oracle = pruner
+        self.gating = None
+        return bool(pruner.trace_map)
+
+    def has_gating(self) -> bool:
+        return self.gating is not None and self.gating.enabled
+
+    def has_oracle(self) -> bool:
+        return self.oracle is not None
+
+    def has_active_oracle(self) -> bool:
+        return bool(self.oracle and self.oracle.active)
+
+    def start_oracle_turn(self, question_id: Any, turn_index: int) -> bool:
+        if self.oracle is None:
+            return False
+        return self.oracle.start_turn(question_id, turn_index)
+
+    def finish_oracle_turn(self) -> Optional[Dict[str, Any]]:
+        if self.oracle is None:
+            return None
+        return self.oracle.finish_turn()
+
+    def start_gating_turn(self) -> None:
+        if self.has_gating():
+            self.gating.start_turn()
+
+    def finish_gating_turn(self) -> Optional[Dict[str, Any]]:
+        if not self.has_gating():
+            return None
+        return self.gating.finish_turn()
+
     def forward(
             self,
             input_ids=None,
@@ -390,11 +1555,15 @@ class EaModel(nn.Module):
             log=False,
             is_llama3=False,
             collect_expert_traces=False,
+            trace_schema: str = "analysis",
 
     ):
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
 
+        trace_schema = (trace_schema or "analysis").lower()
+        if trace_schema not in {"analysis", "training"}:
+            trace_schema = "analysis"
 
         if temperature > 1e-5:
             logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
@@ -441,6 +1610,7 @@ class EaModel(nn.Module):
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
+        gating_active = self.has_gating()
         accept_lengths = []  # Track acceptance lengths per iteration
         iteration_traces: List[Dict[str, Any]] = []
         max_length = max_length - self.ea_layer.total_tokens - 10
@@ -448,36 +1618,130 @@ class EaModel(nn.Module):
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
+            iteration_gating_summary: Optional[Dict[str, Any]] = None
+            iteration_oracle_summary: Optional[Dict[str, Any]] = None
+            iter_draft_tokens = None
+            iter_tree_parents = None
+            iter_tree_position_ids = None
+            iter_retrieve_indices = None
+            iter_draft_log_probs = None
+            depth_hist: List[int] = []
+            tree_depth = 0
+            total_nodes = 0
+
+            nodes_before_prune = int(tree_parents.view(-1).numel())
+
+            nodes_before_prune = int(tree_parents.view(-1).numel())
+
             # Snapshot current tree before verification (CPU copies for logging)
-            if collect_expert_traces:
+            oracle_active = self.has_active_oracle()
+            need_wave_snapshot = (
+                collect_expert_traces or gating_active or (trace_schema == "training") or oracle_active
+            )
+            if need_wave_snapshot:
                 iter_draft_tokens = draft_tokens.detach().to("cpu")
                 iter_tree_parents = tree_parents.detach().to("cpu")
                 iter_tree_position_ids = tree_position_ids.detach().to("cpu")
                 iter_retrieve_indices = retrieve_indices.detach().to("cpu")
                 iter_draft_log_probs = draft_log_probs.detach().to("cpu")
+                iter_tree_depths = iter_tree_position_ids.view(-1)
+                tree_depth = int(iter_tree_depths.max().item()) if iter_tree_depths.numel() else 0
+                depth_hist = torch.bincount(iter_tree_depths, minlength=tree_depth + 1).tolist()
+                total_nodes = int(iter_tree_depths.numel())
+
+            if oracle_active and self.oracle is not None:
+                parents_list_for_oracle: List[int]
+                if iter_tree_parents is not None:
+                    parents_list_for_oracle = iter_tree_parents.view(-1).tolist()
+                else:
+                    parents_list_for_oracle = tree_parents.detach().to("cpu").view(-1).tolist()
+
+                if iter_draft_tokens is not None:
+                    tokens_for_oracle = iter_draft_tokens[0].tolist()
+                else:
+                    tokens_for_oracle = draft_tokens.detach().to("cpu")[0].tolist()
+
+                _, iteration_oracle_summary, keep_mask, _ = self.oracle.apply(
+                    iteration_index=idx,
+                    retrieve_indices=retrieve_indices,
+                    parents=parents_list_for_oracle,
+                    tokens=tokens_for_oracle,
+                )
+
+                keep_sequence = []
+                if iteration_oracle_summary is not None:
+                    keep_sequence = [
+                        int(node)
+                        for node in iteration_oracle_summary.get("matched_nodes", [])
+                        if isinstance(node, int) and node >= 0
+                    ]
+                if not keep_sequence and keep_mask is not None:
+                    keep_sequence = [i for i, flag in enumerate(keep_mask) if flag]
+
+                (
+                    draft_tokens,
+                    tree_mask,
+                    tree_position_ids,
+                    tree_parents,
+                    draft_log_probs,
+                    retrieve_indices,
+                    _new_depths_list,
+                    keep_order,
+                ) = _prune_tree_to_path(
+                    draft_tokens,
+                    tree_parents,
+                    tree_position_ids,
+                    draft_log_probs,
+                    keep_sequence,
+                )
+
+                nodes_after_prune = int(draft_tokens.size(1))
+                if iteration_oracle_summary is not None:
+                    iteration_oracle_summary["nodes_before_prune"] = nodes_before_prune
+                    iteration_oracle_summary["nodes_after_prune"] = nodes_after_prune
+                    iteration_oracle_summary["nodes_pruned"] = max(nodes_before_prune - nodes_after_prune, 0)
+                    iteration_oracle_summary["path_length"] = int(len(keep_order))
+
+                self.base_model.model.tree_mask = tree_mask
+                nodes_before_prune = nodes_after_prune
+
+                if need_wave_snapshot:
+                    iter_draft_tokens = draft_tokens.detach().to("cpu")
+                    iter_tree_parents = tree_parents.detach().to("cpu")
+                    iter_tree_position_ids = tree_position_ids.detach().to("cpu")
+                    iter_retrieve_indices = retrieve_indices.detach().to("cpu")
+                    iter_draft_log_probs = draft_log_probs.detach().to("cpu")
+                    iter_tree_depths = iter_tree_position_ids.view(-1)
+                    tree_depth = int(iter_tree_depths.max().item()) if iter_tree_depths.numel() else 0
+                    depth_hist = torch.bincount(iter_tree_depths, minlength=tree_depth + 1).tolist()
+                    total_nodes = int(iter_tree_depths.numel())
 
             draft_tokens = draft_tokens.to(input_ids.device)
+            tree_mask = tree_mask.to(input_ids.device)
+            tree_position_ids = tree_position_ids.to(input_ids.device)
+            tree_parents = tree_parents.to(input_ids.device)
+            draft_log_probs = draft_log_probs.to(input_ids.device)
+            retrieve_indices = retrieve_indices.to(input_ids.device)
             # Target model forward, get logits
-            collector = ExpertTraceCollector() if collect_expert_traces else None
+            collector = (
+                ExpertTraceCollector()
+                if (collect_expert_traces or gating_active or trace_schema == "training")
+            else None
+            )
             if collector is not None:
                 set_expert_trace_recorder(self.base_model.model, collector)
 
-            routing_weights = None
             subtree_weights_cpu = None
-            routing_weights_cpu = None
             try:
                 subtree_weights = compute_subtree_weights(tree_parents, tree_position_ids)
                 if subtree_weights is not None:
                     if subtree_weights.dim() == 1:
                         subtree_weights = subtree_weights.unsqueeze(0)
                     subtree_weights = subtree_weights.to(draft_tokens.device)
-                    routing_weights = subtree_weights.reshape(-1)
-                    set_token_routing_weights(self.base_model.model, routing_weights)
-                    if collect_expert_traces:
+                    if need_wave_snapshot:
                         subtree_weights_cpu = subtree_weights.detach().to("cpu").tolist()
-                        routing_weights_cpu = routing_weights.detach().to("cpu").tolist()
             except Exception:
-                set_token_routing_weights(self.base_model.model, None)
+                subtree_weights_cpu = None
 
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
@@ -488,9 +1752,46 @@ class EaModel(nn.Module):
                 retrieve_indices,
             )
 
-            set_token_routing_weights(self.base_model.model, None)
             if collector is not None:
                 set_expert_trace_recorder(self.base_model.model, None)
+
+            draft_log_probs_dict: Dict[str, float] = {}
+            draft_log_probs_list: List[float] = []
+            parents_list: List[int] = []
+            depths_list: List[int] = []
+            tokens_list: List[int] = []
+            if need_wave_snapshot and iter_draft_log_probs is not None:
+                try:
+                    draft_log_probs_list = iter_draft_log_probs.tolist()
+                    draft_log_probs_dict = {str(idx): float(val) for idx, val in enumerate(draft_log_probs_list)}
+                except Exception:
+                    draft_log_probs_dict = {}
+                parents_list = iter_tree_parents.view(-1).tolist()
+                depths_list = iter_tree_position_ids.view(-1).tolist()
+                tokens_list = iter_draft_tokens[0].tolist()
+
+            if gating_active and need_wave_snapshot and self.gating is not None:
+                gating_node_table = _build_gating_node_table(
+                    parents_list,
+                    depths_list,
+                    tokens_list,
+                    depth_hist,
+                    tree_depth,
+                    subtree_weights_cpu,
+                    draft_log_probs_list,
+                    collector,
+                )
+                updated_retrieve_indices, iteration_gating_summary, _, kept_rows = self.gating.apply(
+                    gating_node_table,
+                    retrieve_indices,
+                )
+                retrieve_indices = updated_retrieve_indices
+                if kept_rows is not None and kept_rows.numel() > 0 and logits.shape[0] >= kept_rows.max().item() + 1:
+                    kept_rows_device = kept_rows.to(logits.device, non_blocking=True)
+                    logits = logits.index_select(0, kept_rows_device)
+                if need_wave_snapshot:
+                    iter_retrieve_indices = retrieve_indices.detach().to("cpu")
+
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
@@ -526,31 +1827,8 @@ class EaModel(nn.Module):
 
                 iter_tree_depths = iter_tree_position_ids.view(-1)
                 tree_depth = int(iter_tree_depths.max().item()) if iter_tree_depths.numel() else 0
-                depth_hist = torch.bincount(
-                    iter_tree_depths, minlength=tree_depth + 1
-                ).tolist()
+                depth_hist = torch.bincount(iter_tree_depths, minlength=tree_depth + 1).tolist()
                 total_nodes = int(iter_tree_depths.numel())
-                accepted_nodes_set = {n for n in accepted_path if n >= 0}
-                accepted_len = len(accepted_nodes_set)
-
-                accepted_experts_summary: Dict[str, Any] = {}
-                layer_expert_stats: Dict[str, Any] = {}
-                combined_total_unique = 0
-                combined_accepted_unique = 0
-                if collector is not None:
-                    node_depths_list = iter_tree_depths.tolist()
-                    for layer_idx, layer_record in collector.records.items():
-                        stats = summarize_layer_experts(layer_record, node_depths_list, accepted_nodes_set)
-                        layer_key = str(layer_idx)
-                        layer_expert_stats[layer_key] = stats
-                        accepted_experts_summary[layer_key] = {
-                            "unique_count": stats["accepted_unique"],
-                            "experts": stats["accepted_unique_ids"],
-                        }
-                        combined_total_unique += stats["total_unique"]
-                        combined_accepted_unique += stats["accepted_unique"]
-
-                pruned_nodes = total_nodes - accepted_len
 
                 node_log_probs: Dict[str, float] = {}
                 try:
@@ -581,31 +1859,65 @@ class EaModel(nn.Module):
                 except Exception:
                     draft_log_probs_dict = {}
 
-                iteration_traces.append(
-                    {
-                        "iteration": idx,
-                        "tokens": iter_draft_tokens[0].tolist(),
-                        "parents": iter_tree_parents.tolist(),
-                        "depth": iter_tree_position_ids.tolist(),
-                        "retrieve_indices": iter_retrieve_indices.tolist(),
-                        "accepted_nodes": accepted_path,
-                        "tree_total_nodes": total_nodes,
-                        "tree_depth": tree_depth,
-                        "tree_width_by_depth": depth_hist,
-                        "accepted_length": accepted_len,
-                        "accepted_unique_experts": accepted_experts_summary,
-                        "layer_expert_stats": layer_expert_stats,
-                        "total_unique_experts": combined_total_unique,
-                        "accepted_unique_experts_count": combined_accepted_unique,
-                        "pruned_nodes": pruned_nodes,
-                        "subtree_weights": subtree_weights_cpu,
-                        "routing_weights": routing_weights_cpu,
-                        "verification": verification_info,
-                        "node_log_probs": node_log_probs,
-                        "draft_node_log_probs": draft_log_probs_dict,
-                        "experts": collector.to_serializable() if collector is not None else {},
+                parents_list = iter_tree_parents.view(-1).tolist()
+                depths_list = iter_tree_depths.tolist()
+                tokens_list = iter_draft_tokens[0].tolist()
+                retrieve_list = iter_retrieve_indices.tolist()
+                accepted_length = len({n for n in accepted_path if n >= 0})
+
+                if trace_schema == "training":
+                    iteration_record = _build_training_iteration_trace(
+                        idx,
+                        parents_list,
+                        depths_list,
+                        tokens_list,
+                        accepted_path,
+                        depth_hist,
+                        tree_depth,
+                        subtree_weights_cpu,
+                        node_log_probs,
+                        draft_log_probs_dict,
+                        collector,
+                    )
+                else:
+                    iteration_record = _build_analysis_iteration_trace(
+                        idx,
+                        tokens_list,
+                        parents_list,
+                        depths_list,
+                        retrieve_list,
+                        accepted_path,
+                        tree_depth,
+                        depth_hist,
+                        total_nodes,
+                        accepted_length,
+                        collector,
+                        subtree_weights_cpu,
+                        verification_info,
+                        node_log_probs,
+                        draft_log_probs_dict,
+                    )
+
+                if iteration_gating_summary is not None and self.has_gating():
+                    gating_payload = {
+                        "config": iteration_gating_summary.get("config", {}),
+                        "summary": iteration_gating_summary.get("summary", {}),
+                        "nodes": iteration_gating_summary.get("nodes", {}),
                     }
-                )
+                    node_decisions = gating_payload["nodes"]
+                    if trace_schema == "training":
+                        for node_row in iteration_record.get("node_features", []):
+                            info = node_decisions.get(str(node_row.get("node")))
+                            if info:
+                                node_row["accept_score"] = info.get("accept_score")
+                                node_row["cost_score"] = info.get("cost_score")
+                                node_row["effective_cost"] = info.get("effective_cost")
+                                node_row["gating_decision"] = info.get("decision")
+                    iteration_record["gating"] = gating_payload
+                if iteration_oracle_summary is not None:
+                    iteration_record["oracle"] = iteration_oracle_summary
+
+                iteration_traces.append(iteration_record)
             # Adjusting the input sequence, draft model forward
             (
                 input_ids,

@@ -15,12 +15,16 @@ import json
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
+
+TOTAL_LAYER0_EXPERTS = 64.0
 
 BASE_FEATURES: List[str] = [
     "depth",
@@ -36,6 +40,23 @@ BASE_FEATURES: List[str] = [
     "layer0_unique",
     "layer_0_marginal",
     "layer_0_cumulative",
+    "depth_norm",
+    "iteration_norm",
+    "subtree_fraction",
+    "width_fraction",
+    "layer0_cumulative_frac",
+    "layer0_unique_frac",
+    "layer0_remaining_frac",
+    "depth_wave_count",
+    "depth_wave_frac",
+    "parent_branching",
+    "iteration_layer0_marginal_sum",
+    "iteration_layer0_cumulative_max",
+    "iteration_layer0_unique_frac",
+    "depth_wave_layer0_marginal_sum",
+    "depth_wave_layer0_cumulative_mean",
+    "sibling_layer0_marginal_sum",
+    "sibling_layer0_marginal_max",
 ]
 
 PARENT_FEATURES: List[str] = [
@@ -43,6 +64,8 @@ PARENT_FEATURES: List[str] = [
     "parent_higher_marginal",
     "parent_layer0_cumulative",
     "parent_depth",
+    "parent_layer0_cumulative_frac",
+    "parent_layer0_remaining_frac",
 ]
 
 ALL_FEATURES = BASE_FEATURES + PARENT_FEATURES
@@ -86,11 +109,21 @@ def parse_args() -> argparse.Namespace:
         default=Path("results/combined/cost_model_holdout.csv"),
         help="CSV for hold-out predictions (set to '' to skip).",
     )
+    parser.add_argument(
+        "--model-out",
+        type=Path,
+        default=Path("results/combined/cost_model.joblib"),
+        help="Optional path to save the trained regressor (set to '' to skip).",
+    )
     return parser.parse_args()
 
 
 def load_dataset(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path)
     required = {"total_marginal", "layer_0_marginal"}
     missing = required - set(df.columns)
     if missing:
@@ -140,6 +173,89 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df["higher_marginal"] = df["total_marginal"] - df["layer_0_marginal"]
     df["cycle_id"] = build_cycle_id(df)
     df["sample_id"] = df["trace_file"].astype(str) + "::" + df["record_index"].astype(str)
+
+    tree_depth_denom = df["tree_depth"].clip(lower=1)
+    tree_size_denom = df["tree_total_nodes"].clip(lower=1)
+    df["depth_norm"] = df["depth"] / tree_depth_denom
+    if "iteration" in df.columns:
+        max_iteration = df.groupby("sample_id")["iteration"].transform("max").replace(0, 1)
+        df["iteration_norm"] = df["iteration"] / max_iteration
+    else:
+        df["iteration_norm"] = 0.0
+    df["subtree_fraction"] = df["subtree_size"] / tree_size_denom
+    df["width_fraction"] = df["tree_width_at_depth"].fillna(0.0) / tree_size_denom
+
+    df["layer0_cumulative_frac"] = df["layer_0_cumulative"] / TOTAL_LAYER0_EXPERTS
+    df["layer0_unique_frac"] = df["layer0_unique"] / TOTAL_LAYER0_EXPERTS
+    df["layer0_remaining_frac"] = (
+        (TOTAL_LAYER0_EXPERTS - df["layer_0_cumulative"]).clip(lower=0.0) / TOTAL_LAYER0_EXPERTS
+    )
+
+    if {"sample_id", "iteration", "node", "depth"}.issubset(df.columns):
+        iteration_counts = df.groupby(["sample_id", "iteration"])["node"].transform("count").replace(0, 1)
+        depth_wave_counts = (
+            df.groupby(["sample_id", "iteration", "depth"])["node"].transform("count").astype(float)
+        )
+        df["depth_wave_count"] = depth_wave_counts
+        df["depth_wave_frac"] = depth_wave_counts / iteration_counts
+    else:
+        df["depth_wave_count"] = 0.0
+        df["depth_wave_frac"] = 0.0
+
+    if {"sample_id", "iteration", "parent"}.issubset(df.columns):
+        parent_branching = (
+            df.groupby(["sample_id", "iteration", "parent"])["node"].transform("count").astype(float)
+        )
+        df["parent_branching"] = parent_branching
+    else:
+        df["parent_branching"] = 0.0
+
+    if {"sample_id", "iteration"}.issubset(df.columns):
+        iter_group = df.groupby(["sample_id", "iteration"])
+        df["iteration_layer0_marginal_sum"] = iter_group["layer_0_marginal"].transform("sum")
+        df["iteration_layer0_cumulative_max"] = iter_group["layer_0_cumulative"].transform("max")
+        df["iteration_layer0_unique_frac"] = df["iteration_layer0_cumulative_max"] / TOTAL_LAYER0_EXPERTS
+    else:
+        df["iteration_layer0_marginal_sum"] = 0.0
+        df["iteration_layer0_cumulative_max"] = 0.0
+        df["iteration_layer0_unique_frac"] = 0.0
+
+    if {"sample_id", "iteration", "depth"}.issubset(df.columns):
+        depth_iter_group = df.groupby(["sample_id", "iteration", "depth"])
+        df["depth_wave_layer0_marginal_sum"] = depth_iter_group["layer_0_marginal"].transform("sum")
+        df["depth_wave_layer0_cumulative_mean"] = depth_iter_group["layer_0_cumulative"].transform("mean")
+    else:
+        df["depth_wave_layer0_marginal_sum"] = 0.0
+        df["depth_wave_layer0_cumulative_mean"] = 0.0
+
+    if {"sample_id", "iteration", "parent"}.issubset(df.columns):
+        sibling_group = df.groupby(["sample_id", "iteration", "parent"])
+        df["sibling_layer0_marginal_sum"] = sibling_group["layer_0_marginal"].transform("sum")
+        df["sibling_layer0_marginal_max"] = sibling_group["layer_0_marginal"].transform("max")
+    else:
+        df["sibling_layer0_marginal_sum"] = 0.0
+        df["sibling_layer0_marginal_max"] = 0.0
+
+    for column in [
+        "depth_norm",
+        "iteration_norm",
+        "subtree_fraction",
+        "width_fraction",
+        "layer0_cumulative_frac",
+        "layer0_unique_frac",
+        "layer0_remaining_frac",
+        "depth_wave_count",
+        "depth_wave_frac",
+        "parent_branching",
+        "iteration_layer0_marginal_sum",
+        "iteration_layer0_cumulative_max",
+        "iteration_layer0_unique_frac",
+        "depth_wave_layer0_marginal_sum",
+        "depth_wave_layer0_cumulative_mean",
+        "sibling_layer0_marginal_sum",
+        "sibling_layer0_marginal_max",
+    ]:
+        df[column] = df[column].fillna(0.0)
     return df
 
 
@@ -172,6 +288,10 @@ def add_parent_features(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["parent_total_marginal", "parent_higher_marginal", "parent_layer0_cumulative"]:
         merged[col] = merged[col].fillna(0.0)
     merged["parent_depth"] = merged["parent_depth"].fillna(0.0)
+    merged["parent_layer0_cumulative_frac"] = merged["parent_layer0_cumulative"] / TOTAL_LAYER0_EXPERTS
+    merged["parent_layer0_remaining_frac"] = (
+        (TOTAL_LAYER0_EXPERTS - merged["parent_layer0_cumulative"]).clip(lower=0.0) / TOTAL_LAYER0_EXPERTS
+    )
 
     return merged
 
@@ -281,6 +401,10 @@ def main() -> None:
     metrics = evaluate_regressor(model, X_test, y_test)
     write_metrics(metrics, args.metrics_out)
 
+    if args.model_out:
+        args.model_out.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, args.model_out)
+
     if args.predictions_out:
         preds = model.predict(X_test)
         dump_predictions(test_df, preds, args.predictions_out)
@@ -292,6 +416,23 @@ def main() -> None:
     baseline_mae = float(np.mean(np.abs(y_test - y_test.mean())))
     print(f"\nBaseline (predict mean) MAE: {baseline_mae:.4f}")
     print(f"Training samples: {len(X_train)}, hold-out samples: {len(X_test)}")
+
+    try:
+        perm = permutation_importance(
+            model,
+            X_test,
+            y_test,
+            n_repeats=5,
+            random_state=args.seed,
+            n_jobs=1,
+        )
+        scores = perm.importances_mean
+        order = np.argsort(scores)[::-1]
+        print("\nTop features (permutation importance):")
+        for idx in order[: min(15, len(order))]:
+            print(f"  {ALL_FEATURES[idx]:>25s}: {scores[idx]:.6f}")
+    except Exception as exc:
+        print(f"\nWarning: permutation importance failed ({exc})")
 
 
 if __name__ == "__main__":

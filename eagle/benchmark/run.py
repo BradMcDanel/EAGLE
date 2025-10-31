@@ -44,8 +44,6 @@ class ModelSpec:
     id: str
     base_model: str
     ea_model: str
-    max_active_experts: List[int]
-    max_routing_error: List[float]
     cuda_devices: Optional[str]
 
 
@@ -54,8 +52,6 @@ class RunSpec:
     model_spec: ModelSpec
     variant: str
     use_eagle: bool
-    max_active_experts: Optional[int]
-    max_routing_error: Optional[float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,8 +79,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--total-token", type=int, default=63, help="Draft tokens for EAGLE")
     parser.add_argument("--warmup-tokens", type=int, default=16, help="Warmup tokens before evaluation")
-    parser.add_argument("--routing-error-skip-first", type=int, default=0, help="Number of earliest MoE layers to exempt from routing-error pruning")
-    parser.add_argument("--routing-error-skip-last", type=int, default=0, help="Number of final MoE layers to exempt from routing-error pruning")
     parser.add_argument("--run-name", type=str, default=None, help="Optional tag for this sweep")
     parser.add_argument("--overwrite", action="store_true", help="Regenerate answers even if they exist")
     parser.add_argument("--default-gpus", type=str, default=None, help="Fallback CUDA_VISIBLE_DEVICES to use when a model does not specify GPUs")
@@ -102,8 +96,6 @@ def load_model_specs(path: Path) -> List[ModelSpec]:
                 id=entry["id"],
                 base_model=entry["base_model"],
                 ea_model=entry["ea_model"],
-                max_active_experts=list(entry.get("max_active_experts", [])),
-                max_routing_error=[float(x) for x in entry.get("max_routing_error", [])],
                 cuda_devices=entry.get("gpus"),
             )
         )
@@ -111,31 +103,8 @@ def load_model_specs(path: Path) -> List[ModelSpec]:
 
 
 def expand_runs(spec: ModelSpec) -> Iterable[RunSpec]:
-    yield RunSpec(spec, variant=f"{spec.id}-baseline", use_eagle=False, max_active_experts=None, max_routing_error=None)
-    yield RunSpec(spec, variant=f"{spec.id}-eagle", use_eagle=True, max_active_experts=None, max_routing_error=None)
-
-    for budget in spec.max_active_experts:
-        suffix = f"B{budget}"
-        budget_value = None if budget == 0 else budget
-        yield RunSpec(
-            spec,
-            variant=f"{spec.id}-eagle_{suffix}",
-            use_eagle=True,
-            max_active_experts=budget_value,
-            max_routing_error=None,
-        )
-
-    for error_budget in spec.max_routing_error:
-        if error_budget is None:
-            continue
-        suffix = f"Re{str(error_budget).replace('.', 'p')}"
-        yield RunSpec(
-            spec,
-            variant=f"{spec.id}-eagle_{suffix}",
-            use_eagle=True,
-            max_active_experts=None,
-            max_routing_error=error_budget,
-        )
+    yield RunSpec(spec, variant=f"{spec.id}-baseline", use_eagle=False)
+    yield RunSpec(spec, variant=f"{spec.id}-eagle", use_eagle=True)
 
 
 def resolve_datasets(dataset_arg: str, overrides: List[str]) -> Dict[str, Path]:
@@ -177,8 +146,6 @@ def build_args_namespace(
     question_file: Path,
     use_eagle: bool,
     use_eagle3: bool,
-    max_active_experts: Optional[int],
-    max_routing_error: Optional[float],
 ) -> SimpleNamespace:
     return SimpleNamespace(
         bench_name=bench,
@@ -192,10 +159,6 @@ def build_args_namespace(
         use_eagle=use_eagle,
         use_eagle3=use_eagle3,
         total_token=args.total_token,
-        max_active_experts=max_active_experts,
-        max_routing_error=max_routing_error,
-        routing_error_skip_first=args.routing_error_skip_first,
-        routing_error_skip_last=args.routing_error_skip_last,
         collect_expert_traces=False,
         answer_file=None,
         ea_model_path=None,
@@ -309,8 +272,6 @@ def main() -> None:
                         question_path,
                         run.use_eagle,
                         use_eagle3=True,
-                        max_active_experts=run.max_active_experts,
-                        max_routing_error=run.max_routing_error,
                     )
 
                     devices = run.model_spec.cuda_devices or args.default_gpus
@@ -358,8 +319,6 @@ def main() -> None:
                                 "generation_stats_mean_tokens_per_iter": generation_stats.get("mean_tokens_per_iter", 0.0),
                                 "generation_stats_mean_accept_length": generation_stats.get("mean_accept_length", 0.0),
                                 "config_use_eagle": 1.0 if run.use_eagle else 0.0,
-                                "config_max_active_experts": run.max_active_experts,
-                                "config_max_routing_error": run.max_routing_error,
                                 "config_num_questions": args.num_questions,
                                 "config_temperature": args.temperature,
                                 "config_total_token": args.total_token,
@@ -382,8 +341,6 @@ def main() -> None:
                         "base_model": run.model_spec.base_model,
                         "ea_model": run.model_spec.ea_model,
                         "use_eagle": run.use_eagle,
-                        "max_active_experts": run.max_active_experts,
-                        "max_routing_error": run.max_routing_error,
                         "num_questions": args.num_questions,
                         "temperature": args.temperature,
                         "total_token": args.total_token,
@@ -418,8 +375,6 @@ def main() -> None:
                         "generation_stats_mean_tokens_per_iter": generation_stats.get("mean_tokens_per_iter", 0.0),
                         "generation_stats_mean_accept_length": generation_stats.get("mean_accept_length", 0.0),
                         "config_use_eagle": 1.0 if run.use_eagle else 0.0,
-                        "config_max_active_experts": run.max_active_experts,
-                        "config_max_routing_error": run.max_routing_error,
                         "config_num_questions": args.num_questions,
                         "config_temperature": args.temperature,
                         "config_total_token": args.total_token,

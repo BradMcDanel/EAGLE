@@ -84,7 +84,19 @@ def _iter_trace_waves(paths: Iterable[Path], labels: Iterable[str]) -> Iterator[
                 for choice_index, choice in enumerate(record.get("choices", [])):
                     stats_list = choice.get("stats", [])
                     for stats_index, stats in enumerate(stats_list):
+                        trace_schema = stats.get("trace_schema")
+                        trace_pointer = stats.get("trace_pointer")
                         waves = stats.get("expert_traces", [])
+                        if trace_schema == "training" and trace_pointer and not waves:
+                            meta = {
+                                **base_meta,
+                                "choice_index": choice_index,
+                                "stats_index": stats_index,
+                                "wave_index": None,
+                            }
+                            yield meta, {"trace_schema": "training", "trace_pointer": trace_pointer}
+                            continue
+
                         for wave_index, wave in enumerate(waves):
                             meta = {
                                 **base_meta,
@@ -136,6 +148,19 @@ def _rows_for_wave(
     tree_depth = max(depths) if depths else -1
     accepted_len = wave.get("accepted_length")
     tree_width = _ensure_list(wave.get("tree_width_by_depth"))
+
+    layer_stats = wave.get("layer_expert_stats") or {}
+    total_unique = 0
+    accepted_unique = 0
+    unique_by_layer: Dict[str, int] = {}
+    for layer_key, stats in layer_stats.items():
+        total_val = int(stats.get("total_unique", 0) or 0)
+        accepted_val = int(stats.get("accepted_unique", 0) or 0)
+        unique_by_layer[layer_key] = total_val
+        total_unique += total_val
+        accepted_unique += accepted_val
+    layer0_unique = unique_by_layer.get("0", 0)
+    higher_unique = max(total_unique - layer0_unique, 0)
 
     for node_idx in node_order:
         parent_idx = parents[node_idx]
@@ -209,16 +234,67 @@ def _rows_for_wave(
         row["early_marginal"] = early_sum
         row["late_marginal"] = late_sum
         row["total_marginal"] = total_sum
+        row["trace_schema"] = wave.get("trace_schema", "analysis")
+        row["wave_total_unique"] = total_unique
+        row["wave_accepted_unique"] = accepted_unique
+        row["wave_layer0_unique"] = layer0_unique
+        row["wave_higher_unique"] = higher_unique
+        for layer_key, count in unique_by_layer.items():
+            row[f"wave_layer_{layer_key}_total_unique"] = count
 
         rows.append(row)
 
     return rows
 
 
+def _rows_for_training_wave(
+    meta: Dict[str, Any],
+    wave: Dict[str, Any],
+    parquet_cache: Dict[str, pd.DataFrame],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    pointer = wave.get("trace_pointer")
+    if not pointer:
+        return rows
+
+    if pointer not in parquet_cache:
+        parquet_cache[pointer] = pd.read_parquet(pointer)
+
+    df = parquet_cache[pointer]
+    filters = pd.Series(True, index=df.index)
+    for column, meta_key in [
+        ("record_index", "record_index"),
+        ("choice_index", "choice_index"),
+        ("stats_index", "stats_index"),
+    ]:
+        df_col = df.get(column)
+        meta_val = meta.get(meta_key)
+        if df_col is not None and meta_val is not None:
+            filters &= df_col == meta_val
+
+    wave_index_val = meta.get("wave_index")
+    df_wave = df.get("wave_index")
+    if df_wave is not None and wave_index_val is not None:
+        filters &= df_wave == wave_index_val
+
+    subset = df[filters]
+    if subset.empty:
+        return rows
+
+    rows.extend(subset.to_dict("records"))
+    return rows
+
+
 def parse_trace_files(paths: Iterable[Path], labels: Iterable[str]) -> pd.DataFrame:
     rows: List[Dict] = []
+    parquet_cache: Dict[str, pd.DataFrame] = {}
 
     for meta, wave in _iter_trace_waves(paths, labels):
+        trace_schema = wave.get("trace_schema", "analysis")
+        if trace_schema == "training":
+            rows.extend(_rows_for_training_wave(meta, wave, parquet_cache))
+            continue
+
         experts = wave.get("experts") or {}
         if not experts:
             continue
@@ -244,6 +320,11 @@ def parse_trace_files(paths: Iterable[Path], labels: Iterable[str]) -> pd.DataFr
 
         routing_weights = _flatten_numeric_sequence(wave.get("routing_weights"), num_nodes)
         subtree_weights = _flatten_numeric_sequence(wave.get("subtree_weights"), num_nodes)
+        if (
+            not any(isinstance(val, float) and not math.isnan(val) for val in routing_weights)
+            and any(isinstance(val, float) and not math.isnan(val) for val in subtree_weights)
+        ):
+            routing_weights = list(subtree_weights)
 
         accepted_sequence = _ensure_list(wave.get("accepted_nodes"))
         accepted_nodes = set(int(n) for n in accepted_sequence)
@@ -275,6 +356,9 @@ def parse_trace_files(paths: Iterable[Path], labels: Iterable[str]) -> pd.DataFr
 
 
 def compute_correlations(df: pd.DataFrame) -> pd.DataFrame:
+    if "early_marginal" not in df.columns or "late_marginal" not in df.columns:
+        return pd.DataFrame(columns=["dataset", "corr_early_late"])
+
     corrs = []
     for dataset, group in df.groupby("dataset"):
         if group["early_marginal"].std() == 0 or group["late_marginal"].std() == 0:

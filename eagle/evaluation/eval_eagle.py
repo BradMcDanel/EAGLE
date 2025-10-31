@@ -18,8 +18,9 @@ import os
 import sys
 import time
 import numpy as np
+import pandas as pd
+from typing import Any, Dict, List, Optional
 
-import shortuuid
 import torch
 from tqdm import tqdm
 
@@ -28,8 +29,37 @@ script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
 sys.path.insert(0, parent_dir)
 
-from fastchat.llm_judge.common import load_questions
-from fastchat.model import get_conversation_template
+try:
+    from fastchat.llm_judge.common import load_questions  # type: ignore
+except ImportError:
+    def load_questions(path, begin=None, end=None):
+        with open(path, "r") as f:
+            data = [json.loads(line) for line in f]
+        if begin is not None or end is not None:
+            begin = begin or 0
+            end = end or len(data)
+            data = data[begin:end]
+        return data
+
+try:
+    from fastchat.model import get_conversation_template  # type: ignore
+except ImportError:
+    def get_conversation_template(template_name):
+        raise RuntimeError(
+            "fastchat.model is required for conversation templates but is not installed."
+        )
+
+try:
+    import shortuuid  # type: ignore
+
+    def _make_uuid() -> str:
+        return shortuuid.uuid()
+
+except ImportError:
+    import uuid
+
+    def _make_uuid() -> str:
+        return uuid.uuid4().hex
 
 try:
     from eagle.model.ea_model import EaModel
@@ -37,41 +67,6 @@ try:
 except:
     from model.ea_model import EaModel
     from model.utils import prepare_logits_processor
-
-
-def configure_max_active_experts(model: torch.nn.Module, max_active_experts: int) -> int:
-    """Propagate a per-wave expert budget to every supported MoE block."""
-    updated = 0
-    for module in model.modules():
-        setter = getattr(module, "set_max_active_experts", None)
-        if callable(setter):
-            setter(max_active_experts)
-            updated += 1
-    return updated
-
-
-def configure_max_total_routing_error(
-    model: torch.nn.Module,
-    max_total_routing_error: float,
-    skip_first: int = 0,
-    skip_last: int = 0,
-) -> int:
-    """Propagate a routing-error budget with optional layer skips."""
-    updated = 0
-    for module in model.modules():
-        setter = getattr(module, "set_max_total_routing_error", None)
-        if callable(setter):
-            layer_idx = getattr(module, "layer_idx", None)
-            total_layers = getattr(module, "total_layers", None)
-            if layer_idx is not None and total_layers is not None:
-                if layer_idx < skip_first or layer_idx >= total_layers - skip_last:
-                    setter(None)
-                else:
-                    setter(max_total_routing_error)
-            else:
-                setter(max_total_routing_error)
-            updated += 1
-    return updated
 
 
 @torch.inference_mode()
@@ -123,34 +118,31 @@ def run_evaluation(
         device_map="auto",
     )
     model.eval()
-    tokenizer = model.get_tokenizer()
-
-    if args.max_active_experts is not None:
-        updated_blocks = configure_max_active_experts(model.base_model, args.max_active_experts)
-        if updated_blocks:
-            print(
-                f"Capping active experts per wave to {args.max_active_experts}"
-                f" across {updated_blocks} MoE blocks"
-            )
-        else:
-            print("Warning: max_active_experts set but no MoE blocks support this option")
-
-    if args.max_routing_error is not None:
-        if args.max_active_experts is not None:
-            print("Warning: both max_active_experts and max_routing_error set; static cap takes precedence when both are present")
-        updated_blocks = configure_max_total_routing_error(
-            model.base_model,
-            args.max_routing_error,
-            skip_first=args.routing_error_skip_first,
-            skip_last=args.routing_error_skip_last,
+    oracle_enabled = False
+    if args.oracle_trace_file:
+        oracle_enabled = model.configure_oracle(
+            trace_file=args.oracle_trace_file,
+            choice_index=args.oracle_choice_index,
+            strict=args.oracle_strict,
         )
-        if updated_blocks:
-            print(
-                f"Bounding per-layer discarded routing mass at {args.max_routing_error}"
-                f" across {updated_blocks} MoE blocks"
-            )
+        trace_count = len(model.oracle.trace_map) if model.oracle is not None else 0
+        if oracle_enabled:
+            print(f"Oracle trace replay enabled ({trace_count} turn traces loaded from {args.oracle_trace_file}).")
         else:
-            print("Warning: max_routing_error set but no MoE blocks support dynamic error budgeting")
+            print(
+                f"Warning: Oracle trace file '{args.oracle_trace_file}' loaded but no matching traces were found."
+            )
+
+    if not oracle_enabled:
+        model.configure_gating(
+            accept_model_path=args.accept_model_path,
+            cost_model_path=args.cost_model_path,
+            utility_weight=args.utility_weight,
+        )
+    elif args.accept_model_path or args.cost_model_path:
+        print("Note: Ignoring runtime gating models because oracle trace replay is active.")
+
+    tokenizer = model.get_tokenizer()
 
     # Detect if this is a Llama-3, OLMoE, or Qwen3 model (all use tokenizer chat templates)
     is_llama3 = "llama-3" in base_model_path.lower() or "llama3" in base_model_path.lower()
@@ -174,6 +166,35 @@ def run_evaluation(
     print(f"Conversation template: {conv_template}")
     print(f"Max new tokens: {max_new_tokens}")
     print(f"Warmup tokens: {args.warmup_tokens}")
+
+    training_rows: List[Dict[str, Any]] = []
+    training_parquet_path: Optional[str] = None
+    if args.collect_expert_traces and args.trace_schema == "training":
+        base_name, _ = os.path.splitext(answer_file)
+        training_parquet_path = base_name + ".training.parquet"
+        try:
+            os.remove(training_parquet_path)
+        except FileNotFoundError:
+            pass
+
+    def append_training_rows(
+        traces: Optional[List[Dict[str, Any]]],
+        meta: Dict[str, Any],
+    ) -> None:
+        if traces is None:
+            return
+        for trace in traces:
+            if not isinstance(trace, dict) or trace.get("schema") != "training":
+                continue
+            iteration_idx = trace.get("iteration")
+            node_features = trace.get("node_features") or []
+            for node_entry in node_features:
+                row = dict(meta)
+                row["iteration"] = iteration_idx
+                row["wave_index"] = iteration_idx
+                row["trace_schema"] = "training"
+                row.update(node_entry)
+                training_rows.append(row)
 
     # Warmup
     print("Warming up (2 cycles)...")
@@ -214,7 +235,8 @@ def run_evaluation(
                     max_new_tokens=args.warmup_tokens,
                     log=True,
                     is_llama3=is_llama3,
-                    collect_expert_traces=args.collect_expert_traces,
+                    collect_expert_traces=args.collect_expert_traces and args.trace_schema == "analysis",
+                    trace_schema="analysis",
                 )
             else:
                 # Baseline: use naivegenerate (optimized AR decoding)
@@ -254,7 +276,7 @@ def run_evaluation(
     # Evaluate questions
     os.makedirs(os.path.dirname(answer_file), exist_ok=True)
 
-    for question in tqdm(questions, desc="Evaluating"):
+    for record_index, question in enumerate(tqdm(questions, desc="Evaluating")):
         torch.manual_seed(0)
         if use_chat_template:
             messages = []
@@ -285,6 +307,13 @@ def run_evaluation(
             torch.cuda.synchronize()
             start_time = time.time()
 
+            gating_stats = None
+            oracle_turn_active = False
+            if use_eagle and model.has_oracle():
+                oracle_turn_active = model.start_oracle_turn(question.get("question_id"), turn_idx)
+            if use_eagle and model.has_gating():
+                model.start_gating_turn()
+
             if use_eagle:
                 output_ids, new_tokens, iterations, accept_lengths, iteration_traces = model.eagenerate(
                     torch.as_tensor(input_ids).to(model.base_model.device),
@@ -293,6 +322,7 @@ def run_evaluation(
                     log=True,
                     is_llama3=is_llama3,
                     collect_expert_traces=args.collect_expert_traces,
+                    trace_schema=args.trace_schema,
                 )
             else:
                 # Baseline: use naivegenerate (optimized AR decoding)
@@ -304,6 +334,12 @@ def run_evaluation(
                     is_llama3=is_llama3
                 )
                 accept_lengths = None
+
+            if use_eagle and model.has_gating():
+                gating_stats = model.finish_gating_turn()
+            oracle_stats = None
+            if use_eagle and model.has_oracle():
+                oracle_stats = model.finish_oracle_turn()
 
             # Decode output
             output_ids = output_ids[0][len(input_ids[0]):]
@@ -339,6 +375,13 @@ def run_evaluation(
                 'throughput': throughput,
             }
 
+            if use_eagle and gating_stats:
+                turn_stats['gating'] = gating_stats
+            if use_eagle and oracle_stats and oracle_stats.get("expected_iterations", 0) > 0:
+                oracle_payload = dict(oracle_stats)
+                oracle_payload["turn_active"] = bool(oracle_turn_active)
+                turn_stats['oracle'] = oracle_payload
+
             if use_eagle and accept_lengths is not None:
                 # Convert list of tensors to CPU if needed
                 if isinstance(accept_lengths, list):
@@ -357,7 +400,22 @@ def run_evaluation(
                 turn_stats['speedup'] = float(speedup)
                 turn_stats['accept_lengths'] = [int(x) for x in accept_lengths]
                 if args.collect_expert_traces:
-                    turn_stats['expert_traces'] = iteration_traces
+                    turn_stats['trace_schema'] = args.trace_schema
+                    if args.trace_schema == "training" and training_parquet_path is not None:
+                        meta = {
+                            "dataset": args.bench_name,
+                            "trace_file": training_parquet_path,
+                            "record_index": record_index,
+                            "choice_index": turn_idx,
+                            "stats_index": turn_idx,
+                            "question_id": question.get("question_id"),
+                            "model_id": model_id,
+                        }
+                        append_training_rows(iteration_traces, meta)
+                        turn_stats['trace_pointer'] = training_parquet_path
+                        turn_stats['expert_traces'] = []
+                    else:
+                        turn_stats['expert_traces'] = iteration_traces
 
             turns_stats.append(turn_stats)
 
@@ -370,7 +428,7 @@ def run_evaluation(
         # Save answer
         ans_json = {
             "question_id": question["question_id"],
-            "answer_id": shortuuid.uuid(),
+            "answer_id": _make_uuid(),
             "model_id": model_id,
             "choices": [{
                 "index": 0,
@@ -383,7 +441,6 @@ def run_evaluation(
         with open(answer_file, "a") as fout:
             fout.write(json.dumps(ans_json) + "\n")
 
-        # Aggregate statistics
         for turn_stats in turns_stats:
             all_stats['total_tokens'].append(turn_stats['tokens'])
             all_stats['total_iterations'].append(turn_stats['iterations'])
@@ -394,6 +451,11 @@ def run_evaluation(
                 all_stats['avg_accept_length'].append(turn_stats['avg_accept_length'])
                 all_stats['tokens_per_iter'].append(turn_stats['tokens_per_iter'])
                 all_stats['speedup'].append(turn_stats['speedup'])
+
+    if training_rows and training_parquet_path is not None:
+        df = pd.DataFrame(training_rows)
+        df.to_parquet(training_parquet_path, index=False)
+        print(f"Wrote training traces to {training_parquet_path} ({len(df)} rows)")
 
     # Print summary statistics
     print("\n" + "="*70)
@@ -461,18 +523,27 @@ if __name__ == "__main__":
                         help="Use EAGLE-3 mode")
     parser.add_argument("--total-token", type=int, default=63,
                         help="Number of draft tokens for EAGLE")
-    parser.add_argument("--max-active-experts", type=int, default=None,
-                        help="Cap the number of active experts dispatched per wave (default: unlimited)")
-    parser.add_argument("--max-routing-error", type=float, default=None,
-                        help="Maximum routing probability mass that can be discarded per MoE layer")
-    parser.add_argument("--routing-error-skip-first", type=int, default=0,
-                        help="Number of earliest MoE layers to exclude from routing-error pruning")
-    parser.add_argument("--routing-error-skip-last", type=int, default=0,
-                        help="Number of final MoE layers to exclude from routing-error pruning")
     parser.add_argument("--collect-expert-traces", action="store_true",
                         help="Capture per-iteration draft tree and routing traces (adds overhead)")
+    parser.add_argument("--trace-schema", choices=["analysis", "training"], default="analysis",
+                        help="Trace export format when collecting expert traces (analysis = full tree, training = lean node features)")
+    parser.add_argument("--accept-model-path", type=str, default=None,
+                        help="Path to a joblib acceptance model for runtime gating")
+    parser.add_argument("--cost-model-path", type=str, default=None,
+                        help="Path to a joblib cost regressor for runtime gating")
+    parser.add_argument("--utility-weight", type=float, default=0.0,
+                        help="Utility trade-off λ in u = p_accept - λ · higher_marginal (0 disables pruning)")
+    parser.add_argument("--oracle-trace-file", type=str, default=None,
+                        help="Path to a JSONL answer log containing expert_traces for oracle replay pruning")
+    parser.add_argument("--oracle-choice-index", type=int, default=0,
+                        help="Choice index to read from when loading oracle traces")
+    parser.add_argument("--oracle-strict", action="store_true",
+                        help="Fail if oracle trace for a turn is missing or exhausted during replay")
 
     args = parser.parse_args()
+
+    if args.trace_schema == "training" and not args.collect_expert_traces:
+        parser.error("--trace-schema=training requires --collect-expert-traces")
 
     # Validate arguments
     if args.use_eagle and not args.ea_model_path:

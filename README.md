@@ -259,6 +259,12 @@ python -m eagle.evaluation.gen_baseline_answer_llama3chat --ea-model-path yuhuil
 ```
 The above two commands will each generate a .jsonl file that records the generation results and wall time. Then, you can use evaluation/speed.py to calculate the ratio of speeds.
 
+For multi-dataset sweeps we provide a single entrypoint:
+```bash
+python -m eagle.evaluation.eval_eagle --help
+```
+This driver runs baseline and EAGLE modes with the model's native MoE routing and accepts an optional `--collect-expert-traces` flag for detailed tree logs. The lean `--trace-schema training` parquet now records the per-node marginal unique-expert counts used for acceptance/cost training, while `--trace-schema analysis` still captures the full per-wave payload (`layer_expert_stats`, verification dumps, etc.) if you need the richer view.
+
 ## 🌟 Our Contributors
 
 A heartfelt thank you to all our contributors.

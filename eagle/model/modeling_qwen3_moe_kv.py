@@ -268,21 +268,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.experts = nn.ModuleList(
             [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
         )
-        self.max_active_experts = getattr(config, "max_active_experts", None)
-        self.max_total_routing_error = getattr(config, "max_total_routing_error", None)
         self.layer_idx: Optional[int] = None
-        self.total_layers: Optional[int] = getattr(config, "num_hidden_layers", None)
-        self.token_routing_weights: Optional[torch.Tensor] = None
         self.trace_recorder = None
-
-    def set_max_active_experts(self, value: Optional[int]) -> None:
-        self.max_active_experts = value
-
-    def set_max_total_routing_error(self, value: Optional[float]) -> None:
-        self.max_total_routing_error = value
-
-    def set_token_routing_weights(self, value: Optional[torch.Tensor]) -> None:
-        self.token_routing_weights = None if value is None else value.detach()
 
     def set_trace_recorder(self, recorder: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]]) -> None:
         self.trace_recorder = recorder
@@ -290,7 +277,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        max_active_experts: Optional[int] = None,
         expert_counter_list=None,
     ) -> torch.Tensor:
         """ """
@@ -301,42 +287,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         routing_probs = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
 
-        weighted_probs = routing_probs
-        if (
-            self.max_total_routing_error is not None
-            and self.token_routing_weights is not None
-            and self.token_routing_weights.numel() == routing_probs.size(0)
-        ):
-            token_weights = self.token_routing_weights.to(routing_probs.device, dtype=routing_probs.dtype)
-            weighted_probs = routing_probs * token_weights.unsqueeze(1)
-
-        if max_active_experts is None:
-            max_active_experts = self.max_active_experts
-
-        if max_active_experts is not None:
-            budget = min(max_active_experts, self.num_experts)
-            if budget < self.top_k:
-                raise ValueError(
-                    f"max_active_experts ({budget}) must be >= top_k ({self.top_k})"
-                )
-            mass = weighted_probs.sum(dim=0)
-            keep = torch.topk(mass, k=budget, largest=True).indices
-            kept_probs = routing_probs.index_select(1, keep)
-            routing_weights, selected_local = torch.topk(
-                kept_probs, self.top_k, dim=-1
-            )
-            selected_experts = keep[selected_local]
-        elif self.max_total_routing_error is not None:
-            keep = self._select_experts_by_error(routing_probs, weighted_probs)
-            kept_probs = routing_probs.index_select(1, keep)
-            routing_weights, selected_local = torch.topk(
-                kept_probs, self.top_k, dim=-1
-            )
-            selected_experts = keep[selected_local]
-        else:
-            routing_weights, selected_experts = torch.topk(
-                routing_probs, self.top_k, dim=-1
-            )
+        routing_weights, selected_experts = torch.topk(
+            routing_probs, self.top_k, dim=-1
+        )
 
         if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
@@ -386,52 +339,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
-
-    def _select_experts_by_error(self, routing_probs: torch.Tensor, weighted_probs: torch.Tensor) -> torch.Tensor:
-        error_budget = max(float(self.max_total_routing_error), 0.0)
-
-        topk_limit = min(self.top_k + 1, self.num_experts)
-        topk_probs, topk_indices = torch.topk(routing_probs, k=topk_limit, dim=1)
-
-        if self.token_routing_weights is not None and self.token_routing_weights.numel() == routing_probs.size(0):
-            token_weights = self.token_routing_weights.to(routing_probs.device, dtype=routing_probs.dtype)
-        else:
-            token_weights = torch.ones(routing_probs.size(0), dtype=routing_probs.dtype, device=routing_probs.device)
-
-        cost = torch.zeros(self.num_experts, dtype=routing_probs.dtype, device=routing_probs.device)
-
-        for rank in range(min(self.top_k, topk_probs.size(1))):
-            expert_ids = topk_indices[:, rank]
-            probs = topk_probs[:, rank]
-            alt_probs = torch.zeros_like(probs)
-            for alt_rank in range(rank + 1, topk_probs.size(1)):
-                alt_probs = torch.where(
-                    alt_probs > 0,
-                    alt_probs,
-                    topk_probs[:, alt_rank]
-                )
-            drop = torch.clamp(probs - alt_probs, min=0.0) * token_weights
-            cost.index_add_(0, expert_ids, drop)
-
-        total_cost = cost.sum().item()
-        if total_cost <= 0.0:
-            return torch.arange(self.num_experts, device=routing_probs.device)
-
-        normalized_cost = cost / total_cost
-        sorted_cost, sorted_idx = torch.sort(normalized_cost, descending=True)
-
-        cumulative_keep = torch.cumsum(sorted_cost, dim=0)
-        drop_mass = torch.clamp(1.0 - cumulative_keep, min=0.0)
-        keep_count = self.num_experts
-        mask = drop_mass <= error_budget
-        if mask.any():
-            keep_count = max(int(torch.nonzero(mask, as_tuple=False)[0].item()) + 1, self.top_k)
-        else:
-            keep_count = max(self.top_k, 1)
-
-        keep_count = min(keep_count, self.num_experts)
-        keep = sorted_idx[:keep_count]
-        return keep
 
 
 def rotate_half(x):
