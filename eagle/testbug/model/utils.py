@@ -226,10 +226,17 @@ def generate_tree_buffers(tree_choices, device="cuda"):
 
 def initialize_tree(input_ids, model, tree_attn_mask, past_key_values, logits_processor):
     position_ids = torch.arange(input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-    tree_logits, outputs, logits, hidden_state, sample_token = model(
-        input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor,
-        position_ids=position_ids
-    )
+    if hasattr(model, "suspend_expert_cap"):
+        with model.suspend_expert_cap():
+            tree_logits, outputs, logits, hidden_state, sample_token = model(
+                input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor,
+                position_ids=position_ids
+            )
+    else:
+        tree_logits, outputs, logits, hidden_state, sample_token = model(
+            input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor,
+            position_ids=position_ids
+        )
     return tree_logits, logits, hidden_state, sample_token
 
 

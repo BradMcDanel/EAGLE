@@ -19,7 +19,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Union, Tuple
+import os
+import weakref
+from typing import Callable, Dict, Optional, Union, Tuple, List
 
 import torch
 from torch import nn
@@ -270,9 +272,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
         self.layer_idx: Optional[int] = None
         self.trace_recorder = None
+        self.expert_cap: Optional[int] = None
+        self._last_cap_shortlist: Optional[torch.Tensor] = None
+        self.cap_depth_decay: float = float(getattr(config, "moe_cap_depth_decay", 0.7))
+        self._routing_provider_ref: Optional[weakref.ReferenceType] = None
 
     def set_trace_recorder(self, recorder: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]]) -> None:
         self.trace_recorder = recorder
+
+    def attach_routing_provider(self, provider: "Qwen3MoeModel") -> None:
+        self._routing_provider_ref = weakref.ref(provider)
 
     def forward(
         self,
@@ -284,15 +293,125 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
+        routing_probs_full = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
 
-        routing_probs = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+        metadata = None
+        provider = self._routing_provider_ref() if self._routing_provider_ref is not None else None
+        if provider is not None:
+            getter = getattr(provider, "get_routing_metadata", None)
+            if callable(getter):
+                metadata = getter()
 
-        routing_weights, selected_experts = torch.topk(
-            routing_probs, self.top_k, dim=-1
-        )
+        weights: Optional[torch.Tensor] = None
+        if metadata is not None:
+            total_tokens = routing_probs_full.size(0)
+            if total_tokens > 0:
+                weights = torch.ones(
+                    total_tokens,
+                    dtype=routing_probs_full.dtype,
+                    device=routing_probs_full.device,
+                )
+                prefix_val = metadata.get("prefix_len", 0)
+                if isinstance(prefix_val, torch.Tensor):
+                    prefix_len = int(prefix_val.item())
+                else:
+                    prefix_len = int(prefix_val)
+                tree_tokens = max(total_tokens - prefix_len, 0)
+                if tree_tokens > 0:
+                    slice_len = tree_tokens
+                    depths = metadata.get("depths")
+                    log_probs = metadata.get("log_probs")
+
+                    if depths is not None:
+                        depths = depths.to(routing_probs_full.device)
+                        slice_len = min(slice_len, depths.numel())
+                    if log_probs is not None:
+                        log_probs = log_probs.to(routing_probs_full.device)
+                        slice_len = min(slice_len, log_probs.numel())
+
+                    if slice_len > 0:
+                        depth_decay = float(self.cap_depth_decay)
+                        if depths is not None and 0.0 < depth_decay < 1.0:
+                            depth_vals = depths[:slice_len].to(routing_probs_full.dtype)
+                            decay_tensor = torch.full_like(depth_vals, depth_decay)
+                            depth_weights = torch.pow(decay_tensor, depth_vals)
+                        else:
+                            depth_weights = torch.ones(
+                                slice_len,
+                                dtype=routing_probs_full.dtype,
+                                device=routing_probs_full.device,
+                            )
+
+                        if log_probs is not None:
+                            log_vals = log_probs[:slice_len].to(routing_probs_full.dtype)
+                            max_log = torch.nan_to_num(log_vals.max(), nan=0.0)
+                            if torch.isfinite(max_log):
+                                log_vals = log_vals - max_log
+                                prob_weights = torch.exp(log_vals).clamp_min(1e-8)
+                            else:
+                                prob_weights = torch.ones_like(depth_weights)
+                        else:
+                            prob_weights = torch.ones_like(depth_weights)
+
+                        weights[prefix_len:prefix_len + slice_len] = depth_weights * prob_weights
+
+        if weights is not None:
+            importance = torch.sum(routing_probs_full * weights.unsqueeze(1), dim=0)
+        else:
+            importance = routing_probs_full.sum(dim=0)
+
+        shortlist_indices: Optional[torch.Tensor] = None
+        masked_logits = router_logits
+        cap = self.expert_cap
+        if cap is not None and cap > 0:
+            effective_cap = min(max(cap, self.top_k), self.num_experts)
+            if effective_cap < self.num_experts:
+                top1_experts = torch.argmax(router_logits, dim=1)
+                essential = torch.unique(top1_experts)
+                if essential.numel() == 0:
+                    essential = essential.new_empty(0)
+
+                if essential.numel() > effective_cap:
+                    essential_scores = importance[essential]
+                    keep_idx = torch.topk(essential_scores, effective_cap, dim=0).indices
+                    shortlist_indices = essential[keep_idx]
+                else:
+                    remaining = effective_cap - int(essential.numel())
+                    if remaining > 0:
+                        remaining_scores = importance.clone()
+                        if essential.numel() > 0:
+                            remaining_scores[essential] = float("-inf")
+                        extra_indices = torch.topk(remaining_scores, remaining, dim=0).indices
+                        shortlist_indices = (
+                            torch.cat([essential, extra_indices])
+                            if essential.numel() > 0
+                            else extra_indices
+                        )
+                    else:
+                        shortlist_indices = essential
+                mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
+                mask.index_fill_(0, shortlist_indices, False)
+                masked_logits = router_logits.masked_fill(mask, float("-inf"))
+                if os.environ.get("EAGLE_DEBUG_CAP"):
+                    if not hasattr(self, "_debug_cap_prints"):
+                        self._debug_cap_prints = 0
+                    if self._debug_cap_prints < 5:
+                        self._debug_cap_prints += 1
+                        prefix_len = metadata.get("prefix_len") if metadata else None
+                        tree_tokens = routing_probs_full.size(0) - int(prefix_len or 0)
+                        print(
+                            f"[eagle-cap-debug] layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
+                            f"tree_tok={tree_tokens} cap={effective_cap} essential={essential.numel()} ",
+                            flush=True,
+                        )
+        self._last_cap_shortlist = shortlist_indices
+
+        _, selected_experts = torch.topk(masked_logits, self.top_k, dim=-1)
+        routing_weights = routing_probs_full.gather(-1, selected_experts)
 
         if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            denom = routing_weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            routing_weights = routing_weights / denom
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
         selected_experts = selected_experts.to(torch.long)
@@ -304,10 +423,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             except RuntimeError:
                 experts_per_token = selected_experts.view(1, -1, self.top_k)
                 weights_per_token = routing_weights.view(1, -1, self.top_k)
+            shortlist_payload = (
+                self._last_cap_shortlist.detach().to("cpu").tolist()
+                if self._last_cap_shortlist is not None
+                else None
+            )
             self.trace_recorder(
                 self.layer_idx if self.layer_idx is not None else -1,
                 experts_per_token.detach(),
                 weights_per_token.detach(),
+                shortlist=shortlist_payload,
             )
 
         final_hidden_states = torch.zeros(
@@ -639,6 +764,12 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self._routing_metadata: Optional[Dict[str, Union[int, torch.Tensor]]] = None
+
+        for layer in self.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is not None and hasattr(mlp, "attach_routing_provider"):
+                mlp.attach_routing_provider(self)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -680,6 +811,15 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 ] = combined_attention_mask.min()
 
         return combined_attention_mask
+
+    def set_routing_metadata(self, metadata: Optional[Dict[str, Union[int, torch.Tensor]]]) -> None:
+        self._routing_metadata = metadata
+
+    def get_routing_metadata(self) -> Optional[Dict[str, Union[int, torch.Tensor]]]:
+        return self._routing_metadata
+
+    def clear_routing_metadata(self) -> None:
+        self._routing_metadata = None
 
     @can_return_tuple
     @auto_docstring

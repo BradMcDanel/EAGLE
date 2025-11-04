@@ -3,24 +3,11 @@ import json
 import math
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import joblib
-import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
-try:
-    from sklearn.ensemble import HistGradientBoostingClassifier as _HGBCls  # noqa: F401
-    from sklearn.ensemble import HistGradientBoostingRegressor as _HGBReg  # noqa: F401
-    import sklearn._loss._loss as _skloss  # noqa: F401
-    if not hasattr(_skloss, "__pyx_unpickle_CyHalfBinomialLoss"):
-        raise ImportError(
-            "scikit-learn does not expose the required loss unpicklers; "
-            "please ensure the training and runtime environments match."
-        )
-except Exception:
-    pass
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 import os
@@ -30,8 +17,14 @@ from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 #from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen2_kv import Qwen2ForCausalLM as KVQwen2ForCausalLM
-from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
-from .modeling_qwen3_moe_kv import KVQwen3MoeForCausalLM
+try:
+    from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
+except ImportError:
+    KVQwen3ForCausalLM = None
+try:
+    from .modeling_qwen3_moe_kv import KVQwen3MoeForCausalLM
+except ImportError:
+    KVQwen3MoeForCausalLM = None
 from .modeling_olmoe_kv import OlmoeForCausalLM as KVOlmoeForCausalLM
 from .utils import *
 from .kv_cache import initialize_past_key_values
@@ -47,282 +40,25 @@ class ExpertTraceCollector:
     def __init__(self) -> None:
         self.records: Dict[int, Dict[str, List]] = {}
 
-    def record(self, layer_idx: int, experts: torch.Tensor, weights: torch.Tensor) -> None:
+    def record(
+        self,
+        layer_idx: int,
+        experts: torch.Tensor,
+        weights: torch.Tensor,
+        shortlist: Optional[List[int]] = None,
+    ) -> None:
         experts_cpu = experts.to(torch.int64).cpu()
         weights_cpu = weights.to(torch.float32).cpu()
-        self.records[int(layer_idx)] = {
+        record: Dict[str, Any] = {
             "experts": experts_cpu.tolist(),
             "weights": weights_cpu.tolist(),
         }
+        if shortlist is not None:
+            record["shortlist"] = list(shortlist)
+        self.records[int(layer_idx)] = record
 
     def to_serializable(self) -> Dict[str, Dict[str, List]]:
         return {str(k): v for k, v in sorted(self.records.items())}
-
-
-ACCEPT_FEATURES: List[str] = [
-    "depth",
-    "children_count",
-    "is_leaf",
-    "subtree_size",
-    "tree_total_nodes",
-    "tree_depth",
-    "tree_width_at_depth",
-    "draft_log_prob",
-    "routing_weight",
-    "subtree_weight",
-    "layer0_unique",
-    "layer_0_marginal",
-    "layer_0_cumulative",
-]
-
-COST_BASE_FEATURES: List[str] = ACCEPT_FEATURES.copy()
-
-COST_PARENT_FEATURES: List[str] = [
-    "parent_total_marginal",
-    "parent_higher_marginal",
-    "parent_layer0_cumulative",
-    "parent_depth",
-]
-
-COST_ALL_FEATURES: List[str] = COST_BASE_FEATURES + COST_PARENT_FEATURES
-
-
-def _coerce_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        if isinstance(value, bool):
-            return float(value)
-        return default
-
-
-class RuntimeGating:
-    """Runtime gating helper that scores nodes with acceptance/cost models."""
-
-    def __init__(
-        self,
-        accept_model: Optional[Any],
-        accept_model_path: Optional[str],
-        cost_model: Optional[Any],
-        cost_model_path: Optional[str],
-        utility_weight: float,
-    ) -> None:
-        self.accept_model = accept_model
-        self.accept_model_path = accept_model_path
-        self.cost_model = cost_model
-        self.cost_model_path = cost_model_path
-        self.utility_weight = float(utility_weight)
-        self.enabled = bool(self.cost_model is not None and self.utility_weight > 0.0)
-        self._turn_stats: Optional[Dict[str, Any]] = None
-
-    def start_turn(self) -> None:
-        if not self.enabled:
-            self._turn_stats = None
-            return
-        self._turn_stats = {
-            "iterations": 0,
-            "nodes_total": 0,
-            "nodes_pruned": 0,
-            "nodes_kept": 0,
-            "paths_total": 0,
-            "paths_pruned": 0,
-            "paths_kept": 0,
-            "fallback_used": 0,
-        }
-
-    def record_iteration(self, summary: Dict[str, Any]) -> None:
-        if self._turn_stats is None:
-            return
-        self._turn_stats["iterations"] += 1
-        self._turn_stats["nodes_total"] += summary.get("nodes_total", 0)
-        self._turn_stats["nodes_pruned"] += summary.get("nodes_pruned", 0)
-        self._turn_stats["nodes_kept"] += summary.get("nodes_kept", 0)
-        self._turn_stats["paths_total"] += summary.get("paths_total", 0)
-        self._turn_stats["paths_pruned"] += summary.get("paths_pruned", 0)
-        self._turn_stats["paths_kept"] += summary.get("paths_kept", 0)
-        self._turn_stats["fallback_used"] += summary.get("fallback_used", 0)
-
-    def finish_turn(self) -> Optional[Dict[str, Any]]:
-        if self._turn_stats is None:
-            return None
-        summary = dict(self._turn_stats)
-        summary["config"] = self.summary()
-        self._turn_stats = None
-        return summary
-
-    def summary(self) -> Dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "accept_model_path": self.accept_model_path,
-            "cost_model_path": self.cost_model_path,
-            "utility_weight": self.utility_weight,
-        }
-
-    @staticmethod
-    def _feature_vector(names: List[str], node: Dict[str, Any]) -> List[float]:
-        values: List[float] = []
-        for name in names:
-            val = _coerce_float(node.get(name), 0.0)
-            if math.isnan(val):
-                val = 0.0
-            values.append(val)
-        return values
-
-    def _score_nodes(
-        self,
-        node_table: List[Dict[str, Any]],
-        root_index: int = 0,
-    ) -> Tuple[List[bool], Dict[str, Dict[str, Any]], Dict[str, Any]]:
-        num_nodes = len(node_table)
-        keep_mask: List[bool] = [False] * num_nodes
-        node_info: Dict[str, Dict[str, Any]] = {}
-
-        if num_nodes == 0:
-            return keep_mask, node_info, {"nodes_total": 0, "nodes_pruned": 0, "nodes_kept": 0}
-
-        accept_nodes: List[int] = []
-        accept_records: List[List[float]] = []
-        cost_nodes: List[int] = []
-        cost_records: List[List[float]] = []
-
-        for entry in node_table:
-            node_idx = int(entry["node"])
-            if node_idx == root_index:
-                keep_mask[node_idx] = True
-                node_info[str(node_idx)] = {
-                    "accept_score": 1.0,
-                    "cost_score": 0.0,
-                    "effective_cost": 0.0,
-                    "utility": 1.0,
-                    "decision": "force_keep",
-                }
-                continue
-            if self.accept_model is not None:
-                accept_records.append(self._feature_vector(ACCEPT_FEATURES, entry))
-                accept_nodes.append(node_idx)
-            if self.cost_model is not None:
-                base_feats = self._feature_vector(COST_BASE_FEATURES, entry)
-                parent_feats = self._feature_vector(COST_PARENT_FEATURES, entry)
-                cost_records.append(base_feats + parent_feats)
-                cost_nodes.append(node_idx)
-
-        accept_scores: Dict[int, float] = {}
-        if self.accept_model is not None and accept_nodes:
-            X_accept = pd.DataFrame(accept_records, columns=ACCEPT_FEATURES)
-            with np.errstate(all="ignore"):
-                probs = self.accept_model.predict_proba(X_accept)[:, 1]
-            for idx, score in zip(accept_nodes, probs):
-                accept_scores[idx] = float(score)
-
-        cost_scores: Dict[int, float] = {}
-        if self.cost_model is not None and cost_nodes:
-            X_cost = pd.DataFrame(cost_records, columns=COST_ALL_FEATURES)
-            with np.errstate(all="ignore"):
-                preds = self.cost_model.predict(X_cost)
-            for idx, cost_val in zip(cost_nodes, preds):
-                cost_scores[idx] = float(cost_val)
-
-        nodes_pruned = 0
-        nodes_kept = 0
-        total_evaluable = max(0, num_nodes - 1)
-
-        for entry in node_table:
-            node_idx = int(entry["node"])
-            if node_idx == root_index:
-                continue
-
-            accept_score = accept_scores.get(node_idx, 1.0) if self.accept_model is not None else 1.0
-            marginal_cost = max(cost_scores.get(node_idx, 0.0), 0.0)
-            effective_cost = marginal_cost
-            utility = accept_score - self.utility_weight * effective_cost
-            decision = "kept" if utility >= 0.0 else "pruned"
-            keep_mask[node_idx] = utility >= 0.0
-
-            if keep_mask[node_idx]:
-                nodes_kept += 1
-            else:
-                nodes_pruned += 1
-
-            node_info[str(node_idx)] = {
-                "accept_score": accept_score,
-                "cost_score": marginal_cost,
-                "effective_cost": effective_cost,
-                "utility": utility,
-                "decision": decision,
-            }
-
-        summary = {
-            "nodes_total": total_evaluable,
-            "nodes_pruned": nodes_pruned,
-            "nodes_kept": nodes_kept,
-        }
-
-        return keep_mask, node_info, summary
-
-    def _filter_paths(
-        self,
-        retrieve_indices: torch.Tensor,
-        keep_mask: List[bool],
-    ) -> Tuple[torch.Tensor, Dict[str, Any], torch.Tensor]:
-        if retrieve_indices.numel() == 0:
-            width = retrieve_indices.size(1) if retrieve_indices.dim() > 1 else 1
-            fallback = torch.full((1, width), -1, dtype=torch.long, device=retrieve_indices.device)
-            fallback[0, 0] = 0
-            kept_rows = torch.tensor([0], dtype=torch.long, device=retrieve_indices.device)
-            return fallback, {"paths_total": 0, "paths_kept": 1, "paths_pruned": 0, "fallback_used": 1}, kept_rows
-
-        retrieve_cpu = retrieve_indices.detach().to("cpu")
-        kept_rows: List[int] = []
-        for row_idx in range(retrieve_cpu.size(0)):
-            nodes = [int(val) for val in retrieve_cpu[row_idx].tolist() if val >= 0]
-            if all(keep_mask[node] for node in nodes):
-                kept_rows.append(row_idx)
-
-        fallback_used = 0
-        if kept_rows:
-            kept_tensor = torch.tensor(kept_rows, dtype=torch.long)
-            filtered_cpu = retrieve_cpu.index_select(0, kept_tensor)
-        else:
-            filtered_cpu = torch.full((1, retrieve_cpu.size(1)), -1, dtype=torch.long)
-            filtered_cpu[0, 0] = 0
-            fallback_used = 1
-            kept_tensor = torch.tensor([0], dtype=torch.long)
-
-        filtered = filtered_cpu.to(retrieve_indices.device)
-        paths_total = retrieve_cpu.size(0)
-        paths_kept = filtered_cpu.size(0)
-        summary = {
-            "paths_total": paths_total,
-            "paths_kept": paths_kept,
-            "fallback_used": fallback_used,
-        }
-        return filtered, summary, kept_tensor.to(retrieve_indices.device)
-
-    def apply(
-        self,
-        node_table: List[Dict[str, Any]],
-        retrieve_indices: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], Optional[List[bool]], torch.Tensor]:
-        if not self.enabled:
-            kept_rows = torch.arange(
-                retrieve_indices.size(0), device=retrieve_indices.device, dtype=torch.long
-            ) if retrieve_indices.dim() > 0 else torch.tensor([], dtype=torch.long, device=retrieve_indices.device)
-            return retrieve_indices, None, None, kept_rows
-
-        keep_mask, node_info, node_summary = self._score_nodes(node_table)
-        filtered_indices, path_summary, kept_rows = self._filter_paths(retrieve_indices, keep_mask)
-
-        summary = {**node_summary, **path_summary}
-        self.record_iteration(summary)
-
-        gating_payload = {
-            "config": self.summary(),
-            "summary": summary,
-            "nodes": node_info,
-        }
-        return filtered_indices, gating_payload, keep_mask, kept_rows
 
 
 class OracleTracePruner:
@@ -1084,135 +820,6 @@ def _build_training_iteration_trace(
     }
 
 
-def _build_gating_node_table(
-    parents: List[int],
-    depths: List[int],
-    tokens: List[int],
-    depth_hist: List[int],
-    tree_depth: int,
-    subtree_weights_payload: Optional[List[Any]],
-    draft_log_probs: List[float],
-    collector: Optional["ExpertTraceCollector"],
-) -> List[Dict[str, Any]]:
-    num_nodes = len(parents)
-    children = _compute_children(parents, num_nodes)
-    reverse_order = sorted(range(num_nodes), key=lambda idx: depths[idx], reverse=True)
-    subtree_sizes = _compute_subtree_sizes(children, reverse_order)
-
-    layer0_stats = _compute_layer0_stats(collector, num_nodes)
-    layer0_lists = layer0_stats["experts"]
-    layer0_sets = [set(items) for items in layer0_lists]
-    routing_weights = layer0_stats["routing_weights"]
-
-    layer_node_sets: Dict[int, List[set[int]]] = {0: layer0_sets}
-    if collector is not None:
-        for layer_idx, layer_record in collector.records.items():
-            if layer_idx == 0:
-                continue
-            expert_lists = _normalize_int_lists(layer_record.get("experts"), num_nodes)
-            layer_node_sets[layer_idx] = [set(items) for items in expert_lists]
-
-    layer_cumulative_sets: Dict[int, List[set[int]]] = {
-        layer_idx: [set() for _ in range(num_nodes)]
-        for layer_idx in layer_node_sets
-    }
-    layer_marginal_counts: Dict[int, List[int]] = {
-        layer_idx: [0] * num_nodes for layer_idx in layer_node_sets
-    }
-    layer_cumulative_counts: Dict[int, List[int]] = {
-        layer_idx: [0] * num_nodes for layer_idx in layer_node_sets
-    }
-
-    node_order = sorted(range(num_nodes), key=lambda idx: depths[idx])
-    for node_idx in node_order:
-        parent_idx = parents[node_idx]
-        for layer_idx, node_sets in layer_node_sets.items():
-            node_set = node_sets[node_idx]
-            parent_set = layer_cumulative_sets[layer_idx][parent_idx] if parent_idx >= 0 else set()
-            marginal = node_set - parent_set
-            cumulative = parent_set.union(node_set)
-            layer_cumulative_sets[layer_idx][node_idx] = cumulative
-            layer_marginal_counts[layer_idx][node_idx] = len(marginal)
-            layer_cumulative_counts[layer_idx][node_idx] = len(cumulative)
-
-    layer0_marginal = layer_marginal_counts.get(0, [0] * num_nodes)
-    layer0_cumulative = layer_cumulative_counts.get(0, [0] * num_nodes)
-    layer0_unique = [len(layer_node_sets.get(0, [set() for _ in range(num_nodes)])[idx]) for idx in range(num_nodes)]
-
-    total_marginal = [0] * num_nodes
-    for counts in layer_marginal_counts.values():
-        for idx, value in enumerate(counts):
-            total_marginal[idx] += value
-    higher_marginal = [total_marginal[idx] - layer0_marginal[idx] for idx in range(num_nodes)]
-
-    if isinstance(subtree_weights_payload, list) and subtree_weights_payload and isinstance(subtree_weights_payload[0], list):
-        subtree_weights = subtree_weights_payload[0]
-    else:
-        subtree_weights = subtree_weights_payload or []
-    if len(subtree_weights) < num_nodes:
-        subtree_weights = subtree_weights + [0.0] * (num_nodes - len(subtree_weights))
-    else:
-        subtree_weights = subtree_weights[:num_nodes]
-
-    if len(tokens) < num_nodes:
-        tokens = tokens + [None] * (num_nodes - len(tokens))
-    else:
-        tokens = tokens[:num_nodes]
-
-    if len(draft_log_probs) < num_nodes:
-        draft_log_probs = draft_log_probs + [0.0] * (num_nodes - len(draft_log_probs))
-    else:
-        draft_log_probs = draft_log_probs[:num_nodes]
-
-    node_table: List[Dict[str, Any]] = []
-    tree_total_nodes = num_nodes
-    for node_idx in range(num_nodes):
-        parent_idx = parents[node_idx]
-        depth_val = depths[node_idx] if node_idx < len(depths) else 0
-        width_val = depth_hist[depth_val] if 0 <= depth_val < len(depth_hist) else 0
-        routing_weight = float(routing_weights[node_idx]) if node_idx < len(routing_weights) else 0.0
-        subtree_weight = float(subtree_weights[node_idx]) if node_idx < len(subtree_weights) else 0.0
-        layer0_unique_val = layer0_unique[node_idx]
-        layer0_marginal_val = layer0_marginal[node_idx]
-        layer0_cumulative_val = layer0_cumulative[node_idx]
-        total_marginal_val = total_marginal[node_idx]
-        higher_marginal_val = higher_marginal[node_idx]
-
-        parent_total = total_marginal[parent_idx] if parent_idx >= 0 else 0.0
-        parent_higher = higher_marginal[parent_idx] if parent_idx >= 0 else 0.0
-        parent_layer0_cumulative = layer0_cumulative[parent_idx] if parent_idx >= 0 else 0.0
-        parent_depth = depths[parent_idx] if parent_idx >= 0 else 0.0
-
-        entry = {
-            "node": node_idx,
-            "parent": parent_idx,
-            "depth": depth_val,
-            "children_count": len(children[node_idx]),
-            "is_leaf": 1 if not children[node_idx] else 0,
-            "is_root": 1 if parent_idx < 0 else 0,
-            "subtree_size": subtree_sizes[node_idx],
-            "tree_total_nodes": tree_total_nodes,
-            "tree_depth": tree_depth,
-            "tree_width_at_depth": width_val,
-            "draft_log_prob": float(draft_log_probs[node_idx]),
-            "routing_weight": routing_weight,
-            "subtree_weight": subtree_weight,
-            "layer0_unique": layer0_unique_val,
-            "layer_0_marginal": float(layer0_marginal_val),
-            "layer_0_cumulative": float(layer0_cumulative_val),
-            "total_marginal": float(total_marginal_val),
-            "higher_marginal": float(higher_marginal_val),
-            "parent_total_marginal": float(parent_total),
-            "parent_higher_marginal": float(parent_higher),
-            "parent_layer0_cumulative": float(parent_layer0_cumulative),
-            "parent_depth": float(parent_depth),
-            "token_id": tokens[node_idx],
-        }
-        node_table.append(entry)
-
-    return node_table
-
-
 def _build_analysis_iteration_trace(
     iteration_index: int,
     tokens: List[int],
@@ -1329,8 +936,10 @@ class EaModel(nn.Module):
         load_=self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
-        self.gating: Optional[RuntimeGating] = None
         self.oracle: Optional[OracleTracePruner] = None
+        self._expert_cap: Optional[int] = None
+        self._cap_suspend_depth: int = 0
+        self._apply_expert_cap(None)
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -1364,10 +973,14 @@ class EaModel(nn.Module):
                 base_model_path, **kwargs
             )
         elif Type == 'Qwen3ForCausalLM':
+            if KVQwen3ForCausalLM is None:
+                raise ImportError("Qwen3ForCausalLM support is unavailable in this build of transformers")
             base_model = KVQwen3ForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
         elif Type == 'Qwen3MoeForCausalLM':
+            if KVQwen3MoeForCausalLM is None:
+                raise ImportError("Qwen3MoeForCausalLM support is unavailable in this build of transformers")
             base_model = KVQwen3MoeForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
@@ -1432,39 +1045,6 @@ class EaModel(nn.Module):
 
         return model
 
-    def configure_gating(
-            self,
-            accept_model_path: Optional[str] = None,
-            cost_model_path: Optional[str] = None,
-            utility_weight: float = 0.0,
-    ) -> None:
-        accept_model = None
-        if accept_model_path:
-            try:
-                accept_model = joblib.load(accept_model_path)
-            except Exception as exc:
-                raise RuntimeError(f"Failed to load acceptance model from '{accept_model_path}'.") from exc
-
-        cost_model = None
-        if cost_model_path:
-            try:
-                cost_model = joblib.load(cost_model_path)
-            except Exception as exc:
-                raise RuntimeError(f"Failed to load cost model from '{cost_model_path}'.") from exc
-
-        gating = RuntimeGating(
-            accept_model=accept_model,
-            accept_model_path=accept_model_path,
-            cost_model=cost_model,
-            cost_model_path=cost_model_path,
-            utility_weight=float(utility_weight),
-        )
-
-        if not gating.enabled:
-            self.gating = None
-            return
-        self.gating = gating
-
     def configure_oracle(
             self,
             trace_file: Optional[str] = None,
@@ -1484,11 +1064,40 @@ class EaModel(nn.Module):
         if not pruner.trace_map and strict:
             raise ValueError(f"No oracle traces loaded from {trace_file}")
         self.oracle = pruner
-        self.gating = None
         return bool(pruner.trace_map)
 
-    def has_gating(self) -> bool:
-        return self.gating is not None and self.gating.enabled
+    def _apply_expert_cap(self, cap: Optional[int]) -> None:
+        effective_cap = None if cap is None else int(cap)
+        for module in self.base_model.modules():
+            if hasattr(module, "expert_cap"):
+                module.expert_cap = effective_cap
+
+    def set_expert_cap(self, cap: Optional[int]) -> None:
+        if cap is None:
+            self._expert_cap = None
+        else:
+            if cap <= 0:
+                self._expert_cap = None
+            else:
+                self._expert_cap = int(cap)
+        if self._cap_suspend_depth == 0:
+            self._apply_expert_cap(self._expert_cap)
+
+    @contextmanager
+    def suspend_expert_cap(self):
+        """Temporarily disable expert capping (e.g., during KV prefill)."""
+        if self._expert_cap is None:
+            yield
+            return
+        if self._cap_suspend_depth == 0:
+            self._apply_expert_cap(None)
+        self._cap_suspend_depth += 1
+        try:
+            yield
+        finally:
+            self._cap_suspend_depth -= 1
+            if self._cap_suspend_depth == 0:
+                self._apply_expert_cap(self._expert_cap)
 
     def has_oracle(self) -> bool:
         return self.oracle is not None
@@ -1505,15 +1114,6 @@ class EaModel(nn.Module):
         if self.oracle is None:
             return None
         return self.oracle.finish_turn()
-
-    def start_gating_turn(self) -> None:
-        if self.has_gating():
-            self.gating.start_turn()
-
-    def finish_gating_turn(self) -> Optional[Dict[str, Any]]:
-        if not self.has_gating():
-            return None
-        return self.gating.finish_turn()
 
     def forward(
             self,
@@ -1610,7 +1210,6 @@ class EaModel(nn.Module):
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
-        gating_active = self.has_gating()
         accept_lengths = []  # Track acceptance lengths per iteration
         iteration_traces: List[Dict[str, Any]] = []
         max_length = max_length - self.ea_layer.total_tokens - 10
@@ -1618,7 +1217,6 @@ class EaModel(nn.Module):
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
-            iteration_gating_summary: Optional[Dict[str, Any]] = None
             iteration_oracle_summary: Optional[Dict[str, Any]] = None
             iter_draft_tokens = None
             iter_tree_parents = None
@@ -1636,7 +1234,7 @@ class EaModel(nn.Module):
             # Snapshot current tree before verification (CPU copies for logging)
             oracle_active = self.has_active_oracle()
             need_wave_snapshot = (
-                collect_expert_traces or gating_active or (trace_schema == "training") or oracle_active
+                collect_expert_traces or (trace_schema == "training") or oracle_active
             )
             if need_wave_snapshot:
                 iter_draft_tokens = draft_tokens.detach().to("cpu")
@@ -1725,7 +1323,7 @@ class EaModel(nn.Module):
             # Target model forward, get logits
             collector = (
                 ExpertTraceCollector()
-                if (collect_expert_traces or gating_active or trace_schema == "training")
+                if (collect_expert_traces or trace_schema == "training")
             else None
             )
             if collector is not None:
@@ -1750,6 +1348,7 @@ class EaModel(nn.Module):
                 tree_position_ids,
                 input_ids,
                 retrieve_indices,
+                draft_log_probs,
             )
 
             if collector is not None:
@@ -1769,28 +1368,6 @@ class EaModel(nn.Module):
                 parents_list = iter_tree_parents.view(-1).tolist()
                 depths_list = iter_tree_position_ids.view(-1).tolist()
                 tokens_list = iter_draft_tokens[0].tolist()
-
-            if gating_active and need_wave_snapshot and self.gating is not None:
-                gating_node_table = _build_gating_node_table(
-                    parents_list,
-                    depths_list,
-                    tokens_list,
-                    depth_hist,
-                    tree_depth,
-                    subtree_weights_cpu,
-                    draft_log_probs_list,
-                    collector,
-                )
-                updated_retrieve_indices, iteration_gating_summary, _, kept_rows = self.gating.apply(
-                    gating_node_table,
-                    retrieve_indices,
-                )
-                retrieve_indices = updated_retrieve_indices
-                if kept_rows is not None and kept_rows.numel() > 0 and logits.shape[0] >= kept_rows.max().item() + 1:
-                    kept_rows_device = kept_rows.to(logits.device, non_blocking=True)
-                    logits = logits.index_select(0, kept_rows_device)
-                if need_wave_snapshot:
-                    iter_retrieve_indices = retrieve_indices.detach().to("cpu")
 
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
@@ -1898,22 +1475,6 @@ class EaModel(nn.Module):
                         draft_log_probs_dict,
                     )
 
-                if iteration_gating_summary is not None and self.has_gating():
-                    gating_payload = {
-                        "config": iteration_gating_summary.get("config", {}),
-                        "summary": iteration_gating_summary.get("summary", {}),
-                        "nodes": iteration_gating_summary.get("nodes", {}),
-                    }
-                    node_decisions = gating_payload["nodes"]
-                    if trace_schema == "training":
-                        for node_row in iteration_record.get("node_features", []):
-                            info = node_decisions.get(str(node_row.get("node")))
-                            if info:
-                                node_row["accept_score"] = info.get("accept_score")
-                                node_row["cost_score"] = info.get("cost_score")
-                                node_row["effective_cost"] = info.get("effective_cost")
-                                node_row["gating_decision"] = info.get("decision")
-                    iteration_record["gating"] = gating_payload
                 if iteration_oracle_summary is not None:
                     iteration_record["oracle"] = iteration_oracle_summary
 
@@ -2009,7 +1570,8 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
-        outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
+        with self.suspend_expert_cap():
+            outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
@@ -2104,6 +1666,7 @@ class EaModel(nn.Module):
                 tree_position_ids,
                 input_ids,
                 retrieve_indices,
+                draft_log_probs,
             )
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
@@ -2189,7 +1752,8 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
-        outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
+        with self.suspend_expert_cap():
+            outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):

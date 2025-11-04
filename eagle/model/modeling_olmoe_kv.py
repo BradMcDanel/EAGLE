@@ -3,7 +3,9 @@
 
 """ PyTorch OLMoE model with KV Cache support."""
 import math
-from typing import Callable, List, Optional, Tuple, Union
+import os
+import weakref
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -27,7 +29,12 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+try:
+    from transformers.modeling_rope_utils import dynamic_rope_update
+except ImportError:  # Older transformers
+    def dynamic_rope_update(*args, **kwargs):
+        return None
 from transformers.models.olmoe.configuration_olmoe import OlmoeConfig
 from transformers.generation.utils import GenerationMixin
 
@@ -390,16 +397,34 @@ class OlmoeAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:  # no matter the length, we just slice it
+        causal_mask = None
+        if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            if causal_mask.dtype != query_states.dtype and causal_mask.dtype != torch.bool:
+                causal_mask = causal_mask.to(query_states.dtype)
+            causal_mask = causal_mask.contiguous()
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_weights = None
+        if output_attentions:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if causal_mask is not None:
+                attn_weights = attn_weights + causal_mask
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states)
+        else:
+            dropout_p = self.attention_dropout if self.training else 0.0
+            sdpa_kwargs = {"is_causal": causal_mask is None and self.is_causal}
+            # `scaled_dot_product_attention` expects mask broadcastable to (bsz, num_heads, q_len, k_len)
+            attn_mask = causal_mask
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                **sdpa_kwargs,
+            )
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -429,9 +454,16 @@ class OlmoeSparseMoeBlock(nn.Module):
         self.experts = nn.ModuleList([OlmoeMLP(config) for _ in range(self.num_experts)])
         self.layer_idx: Optional[int] = None
         self.trace_recorder = None
+        self.expert_cap: Optional[int] = None
+        self._last_cap_shortlist: Optional[torch.Tensor] = None
+        self.cap_depth_decay: float = float(getattr(config, "moe_cap_depth_decay", 0.7))
+        self._routing_provider_ref: Optional[weakref.ReferenceType] = None
 
     def set_trace_recorder(self, recorder: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]]) -> None:
         self.trace_recorder = recorder
+
+    def attach_routing_provider(self, provider: "OlmoeModel") -> None:
+        self._routing_provider_ref = weakref.ref(provider)
 
     def forward(
         self,
@@ -442,15 +474,115 @@ class OlmoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
+        routing_probs_full = F.softmax(router_logits, dim=1, dtype=torch.float)
 
-        routing_probs = F.softmax(router_logits, dim=1, dtype=torch.float)
+        metadata = None
+        provider = self._routing_provider_ref() if self._routing_provider_ref is not None else None
+        if provider is not None:
+            getter = getattr(provider, "get_routing_metadata", None)
+            if callable(getter):
+                metadata = getter()
 
-        routing_weights, selected_experts = torch.topk(
-            routing_probs, self.top_k, dim=-1
-        )
+        def _compute_token_weights() -> Optional[torch.Tensor]:
+            if metadata is None:
+                return None
 
+            total_tokens = routing_probs_full.size(0)
+            if total_tokens == 0:
+                return None
+
+            weights_local = torch.ones(
+                total_tokens,
+                dtype=routing_probs_full.dtype,
+                device=routing_probs_full.device,
+            )
+
+            prefix_val = metadata.get("prefix_len", 0)
+            prefix_len = int(prefix_val.item()) if isinstance(prefix_val, torch.Tensor) else int(prefix_val)
+            tree_tokens = max(total_tokens - prefix_len, 0)
+            if tree_tokens == 0:
+                return weights_local
+
+            slice_len = tree_tokens
+            depths = metadata.get("depths")
+            log_probs = metadata.get("log_probs")
+
+            if depths is not None:
+                depths = depths.to(routing_probs_full.device)
+                slice_len = min(slice_len, depths.numel())
+            if log_probs is not None:
+                log_probs = log_probs.to(routing_probs_full.device)
+                slice_len = min(slice_len, log_probs.numel())
+
+            if slice_len == 0:
+                return weights_local
+
+            depth_decay = float(self.cap_depth_decay)
+            if depths is not None and 0.0 < depth_decay < 1.0:
+                depth_vals = depths[:slice_len].to(routing_probs_full.dtype)
+                base = torch.full_like(depth_vals, depth_decay)
+                depth_weights = torch.pow(base, depth_vals)
+            else:
+                depth_weights = torch.ones(
+                    slice_len,
+                    dtype=routing_probs_full.dtype,
+                    device=routing_probs_full.device,
+                )
+
+            if log_probs is not None:
+                log_vals = log_probs[:slice_len].to(routing_probs_full.dtype)
+                max_log = torch.nan_to_num(log_vals.max(), nan=0.0)
+                if torch.isfinite(max_log):
+                    log_vals = log_vals - max_log
+                    prob_weights = torch.exp(log_vals).clamp_min(1e-8)
+                else:
+                    prob_weights = torch.ones_like(depth_weights)
+            else:
+                prob_weights = torch.ones_like(depth_weights)
+
+            weights_local[prefix_len:prefix_len + slice_len] = depth_weights * prob_weights
+            return weights_local
+
+        weights = _compute_token_weights()
+        if weights is not None:
+            importance = torch.sum(routing_probs_full * weights.unsqueeze(1), dim=0)
+        else:
+            importance = routing_probs_full.sum(dim=0)
+
+        shortlist_indices: Optional[torch.Tensor] = None
+        masked_logits = router_logits
+        cap = self.expert_cap
+        if cap is not None and cap > 0:
+            effective_cap = min(max(int(cap), self.top_k), self.num_experts)
+            if effective_cap < self.num_experts:
+                scores = torch.nan_to_num(importance, nan=0.0, neginf=0.0, posinf=0.0)
+                _, shortlist_indices = torch.topk(scores, effective_cap, dim=0)
+                if shortlist_indices.numel() == 0:
+                    shortlist_indices = torch.arange(effective_cap, device=router_logits.device)
+                mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
+                mask.index_fill_(0, shortlist_indices, False)
+                masked_logits = router_logits.masked_fill(mask, float("-inf"))
+                if os.environ.get("EAGLE_DEBUG_CAP"):
+                    if not hasattr(self, "_debug_cap_prints"):
+                        self._debug_cap_prints = 0
+                    if self._debug_cap_prints < 5:
+                        self._debug_cap_prints += 1
+                        prefix_len = metadata.get("prefix_len") if metadata else None
+                        tree_tokens = routing_probs_full.size(0) - int(prefix_len or 0)
+                        kept_mass = scores[shortlist_indices].sum().item()
+                        print(
+                            f"[eagle-cap-debug] layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
+                            f"tree_tok={tree_tokens} cap={effective_cap} kept_mass={kept_mass:.3f}",
+                            flush=True,
+                        )
+        self._last_cap_shortlist = shortlist_indices
+
+        _, selected_experts = torch.topk(masked_logits, self.top_k, dim=-1)
+        routing_weights = routing_probs_full.gather(-1, selected_experts)
         if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            denom = routing_weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            routing_weights = routing_weights / denom
+
 
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
@@ -463,39 +595,97 @@ class OlmoeSparseMoeBlock(nn.Module):
             except RuntimeError:
                 experts_per_token = selected_experts.view(1, -1, self.top_k)
                 weights_per_token = routing_weights.view(1, -1, self.top_k)
+            shortlist_payload = (
+                self._last_cap_shortlist.detach().to("cpu").tolist()
+                if self._last_cap_shortlist is not None
+                else None
+            )
             self.trace_recorder(
                 self.layer_idx if self.layer_idx is not None else -1,
                 experts_per_token.detach(),
                 weights_per_token.detach(),
+                shortlist=shortlist_payload,
             )
 
+        num_tokens = batch_size * sequence_length
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            (num_tokens, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be selected
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        token_indices = torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand(-1, self.top_k)
+        flat_tokens = token_indices.reshape(-1)
+        flat_experts = selected_experts.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
 
-        expert_hit_all = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False).squeeze(-1)
-        expert_hit = expert_hit_all
+        nonzero = flat_weights != 0
+        flat_tokens = flat_tokens[nonzero]
+        flat_experts = flat_experts[nonzero]
+        flat_weights = flat_weights[nonzero]
 
+        if flat_tokens.numel() == 0:
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states, router_logits
+
+        sorted_order = torch.argsort(flat_experts)
+        flat_experts = flat_experts[sorted_order]
+        flat_tokens = flat_tokens[sorted_order]
+        flat_weights = flat_weights[sorted_order]
+
+        unique_experts, counts = torch.unique_consecutive(flat_experts, return_counts=True)
         if expert_counter_list is not None:
-            expert_counter_list.append(int(expert_hit.numel()))
+            expert_counter_list.append(int(unique_experts.numel()))
 
-        for expert_idx in expert_hit.tolist():
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+        num_active = int(unique_experts.numel())
+        max_count = int(counts.max().item()) if num_active > 0 else 0
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+        if num_active == 0 or max_count == 0:
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states, router_logits
 
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        token_hidden = hidden_states.index_select(0, flat_tokens)
+
+        batched_hidden = hidden_states.new_zeros((num_active, max_count, hidden_dim))
+        batched_weights = flat_weights.new_zeros((num_active, max_count))
+        batched_mask = torch.zeros((num_active, max_count), dtype=torch.bool, device=hidden_states.device)
+
+        expert_starts = torch.cumsum(counts, dim=0) - counts
+        start_list = expert_starts.tolist()
+        count_list = counts.tolist()
+
+        for batch_row, (start_idx, count_val) in enumerate(zip(start_list, count_list)):
+            count_int = int(count_val)
+            if count_int <= 0:
+                continue
+            end_idx = start_idx + count_int
+            batched_hidden[batch_row, :count_int] = token_hidden[start_idx:end_idx]
+            batched_weights[batch_row, :count_int] = flat_weights[start_idx:end_idx]
+            batched_mask[batch_row, :count_int] = True
+
+        expert_indices = [int(idx) for idx in unique_experts.tolist()]
+
+        gate_w = torch.stack([self.experts[idx].gate_proj.weight for idx in expert_indices], dim=0).transpose(1, 2)
+        up_w = torch.stack([self.experts[idx].up_proj.weight for idx in expert_indices], dim=0).transpose(1, 2)
+        down_w = torch.stack([self.experts[idx].down_proj.weight for idx in expert_indices], dim=0).transpose(1, 2)
+
+        dtype = batched_hidden.dtype
+        gate_w = gate_w.to(dtype)
+        up_w = up_w.to(dtype)
+        down_w = down_w.to(dtype)
+
+        gate_out = torch.matmul(batched_hidden, gate_w)
+        up_out = torch.matmul(batched_hidden, up_w)
+        activated = self.experts[expert_indices[0]].act_fn(gate_out)
+        intermediate = activated * up_out
+        expert_output = torch.matmul(intermediate, down_w)
+
+        mask = batched_mask.unsqueeze(-1)
+        expert_output = expert_output.masked_fill(~mask, 0)
+
+        scaled_output = expert_output * batched_weights.unsqueeze(-1).to(expert_output.dtype)
+
+        valid_output = scaled_output[batched_mask].to(hidden_states.dtype)
+        final_hidden_states.index_add_(0, flat_tokens, valid_output)
+
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
@@ -715,6 +905,12 @@ class OlmoeModel(OlmoePreTrainedModel):
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+        self._routing_metadata: Optional[Dict[str, Union[int, torch.Tensor]]] = None
+
+        for layer in self.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is not None and hasattr(mlp, "attach_routing_provider"):
+                mlp.attach_routing_provider(self)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -757,6 +953,15 @@ class OlmoeModel(OlmoePreTrainedModel):
                 ] = combined_attention_mask.min()
 
         return combined_attention_mask
+
+    def set_routing_metadata(self, metadata: Optional[Dict[str, Union[int, torch.Tensor]]]) -> None:
+        self._routing_metadata = metadata
+
+    def get_routing_metadata(self) -> Optional[Dict[str, Union[int, torch.Tensor]]]:
+        return self._routing_metadata
+
+    def clear_routing_metadata(self) -> None:
+        self._routing_metadata = None
 
     @add_start_docstrings_to_model_forward(OLMOE_INPUTS_DOCSTRING)
     def forward(

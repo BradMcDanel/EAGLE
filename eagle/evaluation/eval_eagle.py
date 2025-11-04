@@ -118,6 +118,9 @@ def run_evaluation(
         device_map="auto",
     )
     model.eval()
+    model.set_expert_cap(args.expert_cap)
+    if args.expert_cap is not None:
+        print(f"Applying expert cap: {args.expert_cap}")
     oracle_enabled = False
     if args.oracle_trace_file:
         oracle_enabled = model.configure_oracle(
@@ -132,15 +135,6 @@ def run_evaluation(
             print(
                 f"Warning: Oracle trace file '{args.oracle_trace_file}' loaded but no matching traces were found."
             )
-
-    if not oracle_enabled:
-        model.configure_gating(
-            accept_model_path=args.accept_model_path,
-            cost_model_path=args.cost_model_path,
-            utility_weight=args.utility_weight,
-        )
-    elif args.accept_model_path or args.cost_model_path:
-        print("Note: Ignoring runtime gating models because oracle trace replay is active.")
 
     tokenizer = model.get_tokenizer()
 
@@ -307,12 +301,9 @@ def run_evaluation(
             torch.cuda.synchronize()
             start_time = time.time()
 
-            gating_stats = None
             oracle_turn_active = False
             if use_eagle and model.has_oracle():
                 oracle_turn_active = model.start_oracle_turn(question.get("question_id"), turn_idx)
-            if use_eagle and model.has_gating():
-                model.start_gating_turn()
 
             if use_eagle:
                 output_ids, new_tokens, iterations, accept_lengths, iteration_traces = model.eagenerate(
@@ -335,8 +326,6 @@ def run_evaluation(
                 )
                 accept_lengths = None
 
-            if use_eagle and model.has_gating():
-                gating_stats = model.finish_gating_turn()
             oracle_stats = None
             if use_eagle and model.has_oracle():
                 oracle_stats = model.finish_oracle_turn()
@@ -375,8 +364,6 @@ def run_evaluation(
                 'throughput': throughput,
             }
 
-            if use_eagle and gating_stats:
-                turn_stats['gating'] = gating_stats
             if use_eagle and oracle_stats and oracle_stats.get("expected_iterations", 0) > 0:
                 oracle_payload = dict(oracle_stats)
                 oracle_payload["turn_active"] = bool(oracle_turn_active)
@@ -527,12 +514,8 @@ if __name__ == "__main__":
                         help="Capture per-iteration draft tree and routing traces (adds overhead)")
     parser.add_argument("--trace-schema", choices=["analysis", "training"], default="analysis",
                         help="Trace export format when collecting expert traces (analysis = full tree, training = lean node features)")
-    parser.add_argument("--accept-model-path", type=str, default=None,
-                        help="Path to a joblib acceptance model for runtime gating")
-    parser.add_argument("--cost-model-path", type=str, default=None,
-                        help="Path to a joblib cost regressor for runtime gating")
-    parser.add_argument("--utility-weight", type=float, default=0.0,
-                        help="Utility trade-off λ in u = p_accept - λ · higher_marginal (0 disables pruning)")
+    parser.add_argument("--expert-cap", type=int, default=None,
+                        help="Limit the number of experts evaluated per layer (applies to base/verify model)")
     parser.add_argument("--oracle-trace-file", type=str, default=None,
                         help="Path to a JSONL answer log containing expert_traces for oracle replay pruning")
     parser.add_argument("--oracle-choice-index", type=int, default=0,

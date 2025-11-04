@@ -1,8 +1,9 @@
 import copy
 import random
+import os
 
 # typing 
-from typing import List, Tuple
+from typing import Dict, List, Tuple, Union
 import time
 import torch
 
@@ -208,9 +209,15 @@ def generate_tree_buffers(tree_choices, device="cuda"):
 
 
 def initialize_tree0(input_ids, model, past_key_values, logits_processor):
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, outputs, logits, hidden_state, sample_token = model(
-        input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor
-    )
+    if hasattr(model, "suspend_expert_cap"):
+        with model.suspend_expert_cap():
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids, outputs, logits, hidden_state, sample_token = model(
+                input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor
+            )
+    else:
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, outputs, logits, hidden_state, sample_token = model(
+            input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor
+        )
 
     #     if logits_processor is not None:
     #         logits = orig[:, -1]
@@ -230,9 +237,15 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
 def initialize_tree(input_ids, model, past_key_values, logits_processor):
-    outputs, orig, hidden_states = model(
-        input_ids, past_key_values=past_key_values, output_orig=True
-    )
+    if hasattr(model, "suspend_expert_cap"):
+        with model.suspend_expert_cap():
+            outputs, orig, hidden_states = model(
+                input_ids, past_key_values=past_key_values, output_orig=True
+            )
+    else:
+        outputs, orig, hidden_states = model(
+            input_ids, past_key_values=past_key_values, output_orig=True
+        )
 
     if logits_processor is not None:
         logits = orig[:, -1]
@@ -325,18 +338,42 @@ def tree_decoding(
         tree_position_ids,
         input_ids,
         retrieve_indices,
+        draft_log_probs=None,
         return_hidden_states: bool = False,
 ):
     position_ids = tree_position_ids + input_ids.shape[1]
     if position_ids is not None and position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
-    outputs, tree_logits, hidden_state = model(
-        tree_candidates,
-        output_orig=True,
-        past_key_values=past_key_values,
-        position_ids=position_ids,
-        output_hidden_states=return_hidden_states,
-    )
+    routing_provider = getattr(model.base_model, "model", None)
+    metadata_set = False
+    if routing_provider is not None and hasattr(routing_provider, "set_routing_metadata"):
+        metadata: Dict[str, Union[int, torch.Tensor]] = {
+            "prefix_len": input_ids.shape[1],
+            "depths": tree_position_ids.view(-1).detach().to(torch.int16),
+        }
+        if draft_log_probs is not None:
+            metadata["log_probs"] = draft_log_probs.view(-1).detach().to(torch.float32)
+        routing_provider.set_routing_metadata(metadata)
+        metadata_set = True
+        if os.environ.get("EAGLE_DEBUG_CAP"):
+            tree_tokens = metadata["depths"].numel()
+            log_info = metadata.get("log_probs")
+            print(
+                f"[eagle-cap-debug] set metadata prefix={metadata['prefix_len']} tree_tokens={tree_tokens} "
+                f"log_probs={'yes' if log_info is not None else 'no'}",
+                flush=True,
+            )
+    try:
+        outputs, tree_logits, hidden_state = model(
+            tree_candidates,
+            output_orig=True,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            output_hidden_states=return_hidden_states,
+        )
+    finally:
+        if metadata_set and hasattr(routing_provider, "clear_routing_metadata"):
+            routing_provider.clear_routing_metadata()
 
     if model.use_eagle3:
         ea_device = model.ea_layer.lm_head.weight.device
