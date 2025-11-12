@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from . import alpaca, gsm8k, sum_scorer
+from . import alpaca, gsm8k, humaneval, sum_scorer
 
 
 SCORERS = {
     "gsm8k": gsm8k.score,
     "sum": sum_scorer.score,
     "alpaca": alpaca.score,
+    "humaneval": humaneval.score,
 }
 
 

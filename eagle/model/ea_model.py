@@ -4,7 +4,7 @@ import math
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -46,6 +46,9 @@ class ExpertTraceCollector:
         experts: torch.Tensor,
         weights: torch.Tensor,
         shortlist: Optional[List[int]] = None,
+        full_experts: Optional[torch.Tensor] = None,
+        full_weights: Optional[torch.Tensor] = None,
+        precap_shortlist: Optional[List[int]] = None,
     ) -> None:
         experts_cpu = experts.to(torch.int64).cpu()
         weights_cpu = weights.to(torch.float32).cpu()
@@ -55,6 +58,12 @@ class ExpertTraceCollector:
         }
         if shortlist is not None:
             record["shortlist"] = list(shortlist)
+        if full_experts is not None:
+            record["full_experts"] = full_experts.to(torch.int64).cpu().tolist()
+        if full_weights is not None:
+            record["full_weights"] = full_weights.to(torch.float32).cpu().tolist()
+        if precap_shortlist is not None:
+            record["precap_shortlist"] = list(precap_shortlist)
         self.records[int(layer_idx)] = record
 
     def to_serializable(self) -> Dict[str, Dict[str, List]]:
@@ -488,6 +497,9 @@ def summarize_layer_experts(
 
     per_node_experts = _collapse_batch_axis(experts_list)
     per_node_weights = _collapse_batch_axis(weights_list)
+    full_experts_lists = _collapse_batch_axis(layer_record.get("full_experts"))
+    full_weights_lists = _collapse_batch_axis(layer_record.get("full_weights"))
+    precap_shortlist = layer_record.get("precap_shortlist") or []
 
     depth_unique: Dict[int, set] = defaultdict(set)
     accepted_depth_unique: Dict[int, set] = defaultdict(set)
@@ -495,6 +507,7 @@ def summarize_layer_experts(
     accepted_depth_weight: Dict[int, float] = defaultdict(float)
 
     total_unique: set = set()
+    precap_unique: set = set()
     accepted_unique: set = set()
     total_weight = 0.0
     accepted_weight = 0.0
@@ -531,7 +544,14 @@ def summarize_layer_experts(
                 if node_depth is not None:
                     accepted_depth_weight[node_depth] += weight_sum
 
-    return {
+        if node_idx < len(full_experts_lists):
+            flat_full = _flatten_numbers(full_experts_lists[node_idx])
+            if flat_full:
+                precap_unique.update(int(e) for e in flat_full)
+
+    precap_unique.update(int(idx) for idx in precap_shortlist)
+
+    result = {
         "total_unique": len(total_unique),
         "accepted_unique": len(accepted_unique),
         "total_unique_ids": sorted(total_unique),
@@ -543,6 +563,10 @@ def summarize_layer_experts(
         "total_weight": total_weight,
         "accepted_weight": accepted_weight,
     }
+    if precap_unique:
+        result["precap_unique"] = len(precap_unique)
+        result["precap_unique_ids"] = sorted(precap_unique)
+    return result
 
 
 def _compute_children(parents: List[int], num_nodes: int) -> List[List[int]]:
@@ -938,8 +962,9 @@ class EaModel(nn.Module):
         self.ea_layer.init_tree()
         self.oracle: Optional[OracleTracePruner] = None
         self._expert_cap: Optional[int] = None
+        self._expert_cap_schedule: Optional[List[Optional[int]]] = None
         self._cap_suspend_depth: int = 0
-        self._apply_expert_cap(None)
+        self._apply_expert_caps()
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -1066,11 +1091,30 @@ class EaModel(nn.Module):
         self.oracle = pruner
         return bool(pruner.trace_map)
 
-    def _apply_expert_cap(self, cap: Optional[int]) -> None:
+    def _set_all_expert_caps(self, cap: Optional[int]) -> None:
         effective_cap = None if cap is None else int(cap)
         for module in self.base_model.modules():
             if hasattr(module, "expert_cap"):
                 module.expert_cap = effective_cap
+
+    def _apply_expert_caps(self) -> None:
+        if self._cap_suspend_depth > 0:
+            return
+        schedule = self._expert_cap_schedule
+        if schedule is None:
+            self._set_all_expert_caps(self._expert_cap)
+            return
+        max_len = len(schedule)
+        for module in self.base_model.modules():
+            if not hasattr(module, "expert_cap"):
+                continue
+            layer_idx = getattr(module, "layer_idx", None)
+            cap = self._expert_cap
+            if layer_idx is not None and 0 <= int(layer_idx) < max_len:
+                override = schedule[int(layer_idx)]
+                if override is not None:
+                    cap = override
+            module.expert_cap = None if cap is None else int(cap)
 
     def set_expert_cap(self, cap: Optional[int]) -> None:
         if cap is None:
@@ -1081,23 +1125,43 @@ class EaModel(nn.Module):
             else:
                 self._expert_cap = int(cap)
         if self._cap_suspend_depth == 0:
-            self._apply_expert_cap(self._expert_cap)
+            self._apply_expert_caps()
+
+    def set_expert_cap_schedule(
+        self, schedule: Optional[Union[Sequence[Optional[int]], Dict[int, Optional[int]]]]
+    ) -> None:
+        if schedule is None:
+            self._expert_cap_schedule = None
+        else:
+            normalized: List[Optional[int]]
+            if isinstance(schedule, dict):
+                keys = [int(k) for k in schedule.keys()]
+                max_idx = max(keys) + 1 if keys else 0
+                normalized = [None] * max_idx
+                for raw_idx, raw_cap in schedule.items():
+                    idx = int(raw_idx)
+                    normalized[idx] = None if raw_cap is None else int(raw_cap)
+            else:
+                normalized = [None if cap is None else int(cap) for cap in schedule]
+            self._expert_cap_schedule = normalized
+        if self._cap_suspend_depth == 0:
+            self._apply_expert_caps()
 
     @contextmanager
     def suspend_expert_cap(self):
         """Temporarily disable expert capping (e.g., during KV prefill)."""
-        if self._expert_cap is None:
+        if self._expert_cap is None and not self._expert_cap_schedule:
             yield
             return
         if self._cap_suspend_depth == 0:
-            self._apply_expert_cap(None)
+            self._set_all_expert_caps(None)
         self._cap_suspend_depth += 1
         try:
             yield
         finally:
             self._cap_suspend_depth -= 1
             if self._cap_suspend_depth == 0:
-                self._apply_expert_cap(self._expert_cap)
+                self._apply_expert_caps()
 
     def has_oracle(self) -> bool:
         return self.oracle is not None
@@ -1156,6 +1220,7 @@ class EaModel(nn.Module):
             is_llama3=False,
             collect_expert_traces=False,
             trace_schema: str = "analysis",
+            adaptive_controller: Optional[Any] = None,
 
     ):
         if is_llama3:
@@ -1175,6 +1240,12 @@ class EaModel(nn.Module):
         padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
         input_ids = input_ids.clone()
         self.ea_layer.reset_kv()
+        original_cap = getattr(self, "_expert_cap", None)
+        pending_cap: Optional[int] = None
+        if adaptive_controller is not None:
+            on_start = getattr(adaptive_controller, "on_sequence_start", None)
+            if callable(on_start):
+                on_start()
 
         # Initialize the past key and value states
         if hasattr(self, "past_key_values"):
@@ -1214,6 +1285,11 @@ class EaModel(nn.Module):
         iteration_traces: List[Dict[str, Any]] = []
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
+            if pending_cap is not None:
+                self.set_expert_cap(pending_cap)
+                pending_cap = None
+            cap_for_iteration = getattr(self, "_expert_cap", None)
+            iter_start_time = time.time()
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
@@ -1384,7 +1460,21 @@ class EaModel(nn.Module):
                 int(accept_length.item()) if isinstance(accept_length, torch.Tensor) else int(accept_length)
             )
             accept_lengths.append(accept_length_val)
-
+            margin_val = 0.0
+            try:
+                candidate_logits = logits.detach()
+                if candidate_logits.dim() == 3:
+                    pos = max(0, min(accept_length_val, candidate_logits.size(1) - 1))
+                    candidate_logits = candidate_logits[best_candidate_val, pos]
+                elif candidate_logits.dim() == 2:
+                    candidate_logits = candidate_logits[best_candidate_val]
+                if candidate_logits.dim() == 1 and candidate_logits.numel() >= 2:
+                    top_vals, _ = torch.topk(candidate_logits.float(), k=2)
+                    margin_val = float((top_vals[0] - top_vals[1]).item())
+                elif candidate_logits.dim() == 1 and candidate_logits.numel() == 1:
+                    margin_val = float(candidate_logits.item())
+            except Exception:
+                margin_val = 0.0
             verification_info: Dict[str, Any] = {}
             if collect_expert_traces:
                 strategy = "greedy" if logits_processor is None else "posterior"
@@ -1506,6 +1596,20 @@ class EaModel(nn.Module):
                 sample_p
             )
 
+            if adaptive_controller is not None:
+                iter_elapsed = time.time() - iter_start_time
+                iteration_metrics = {
+                    "accept_length": accept_length_val,
+                    "iteration_time": iter_elapsed,
+                    "cap": None if cap_for_iteration is None else int(cap_for_iteration),
+                    "margin": margin_val,
+                }
+                on_iter_end = getattr(adaptive_controller, "on_iteration_end", None)
+                if callable(on_iter_end):
+                    requested_cap = on_iter_end(idx, iteration_metrics)
+                    if requested_cap is not None:
+                        pending_cap = int(requested_cap)
+
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
                     break
@@ -1516,6 +1620,12 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        if adaptive_controller is not None:
+            finish_cb = getattr(adaptive_controller, "on_sequence_end", None)
+            if callable(finish_cb):
+                finish_cb()
+        if original_cap != getattr(self, "_expert_cap", None):
+            self.set_expert_cap(original_cap)
         if not log:
             return input_ids
         else:

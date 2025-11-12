@@ -14,20 +14,24 @@ python eval_eagle.py \
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
 
-# Add parent directory to path for imports
-script_dir = os.path.dirname(__file__)
-parent_dir = os.path.dirname(script_dir)
-sys.path.insert(0, parent_dir)
+# Ensure repository root is available on sys.path for package imports
+script_dir = Path(__file__).resolve().parent
+repo_root = script_dir.parents[1]
+repo_root_str = str(repo_root)
+if repo_root_str not in sys.path:
+    sys.path.insert(0, repo_root_str)
 
 try:
     from fastchat.llm_judge.common import load_questions  # type: ignore
@@ -64,9 +68,495 @@ except ImportError:
 try:
     from eagle.model.ea_model import EaModel
     from eagle.model.utils import prepare_logits_processor
-except:
+    from eagle.utils.moe_layers import discover_moe_layers
+except ImportError:
     from model.ea_model import EaModel
     from model.utils import prepare_logits_processor
+
+    def discover_moe_layers(_model):  # pragma: no cover - only used in fallback
+        raise RuntimeError(
+            "discover_moe_layers is unavailable. Run eval_eagle.py from the repository root so the 'eagle' package is importable."
+        )
+
+
+def load_cap_schedule(path: str, target: float) -> List[Optional[int]]:
+    with open(path, "r") as f:
+        data = json.load(f)
+    allocations = data.get("allocations")
+    if not allocations:
+        raise ValueError(f"No allocations found in schedule file {path}")
+    index_map = data.get("allocation_index_by_target") or {}
+    target_key = str(int(target))
+    idx = index_map.get(target_key)
+    if idx is None:
+        # Fall back to sequential search on float targets.
+        for i, entry in enumerate(allocations):
+            if float(entry.get("target_avg_cap")) == float(target):
+                idx = i
+                break
+    if idx is None:
+        raise ValueError(f"Target {target} not found in schedule file {path}")
+    entry = allocations[idx]
+    caps = entry.get("final_caps")
+    if not isinstance(caps, list):
+        raise ValueError(f"Allocation entry for target {target} missing final_caps in {path}")
+    normalized: List[Optional[int]] = []
+    for cap in caps:
+        if cap is None:
+            normalized.append(None)
+        else:
+            normalized.append(int(cap))
+    return normalized
+
+
+def _validate_cap_target(target: Optional[float]) -> int:
+    if target is None:
+        raise ValueError("cap_schedule_target must be provided when using cap shapes")
+    try:
+        int_target = int(target)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cap_schedule_target must be an integer for cap shapes") from exc
+    if abs(int_target - float(target)) > 1e-6:
+        raise ValueError("cap_schedule_target must be an integer value for cap shapes")
+    if int_target <= 0:
+        raise ValueError("cap_schedule_target must be positive for cap shapes")
+    return int_target
+
+
+def _parse_cap_shape_config(config: Optional[str]) -> Dict[str, Any]:
+    if config is None:
+        return {}
+    config = config.strip()
+    if not config:
+        return {}
+    try:
+        data = json.loads(config)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--cap-shape-config must be valid JSON (e.g., '{\"k_head\":2}')") from exc
+    if not isinstance(data, dict):
+        raise ValueError("--cap-shape-config must decode to a JSON object")
+    return data
+
+
+def _collect_moe_context(model: EaModel) -> Dict[str, Any]:
+    moe_layers = discover_moe_layers(model)
+    if not moe_layers:
+        raise ValueError("Cap shape scheduling requires a model with MoE layers, but none were found.")
+    num_hidden_layers = getattr(model.config, "num_hidden_layers", None)
+    schedule_length = 0
+    if num_hidden_layers is not None:
+        try:
+            schedule_length = int(num_hidden_layers)
+        except (TypeError, ValueError):
+            schedule_length = 0
+    schedule_length = max(schedule_length, max(moe_layers) + 1)
+    if schedule_length <= 0:
+        raise ValueError("Model reports no transformer layers; cannot build cap schedule.")
+
+    top_k: Optional[int] = None
+    num_experts: Optional[int] = None
+    for module in model.base_model.modules():
+        if not hasattr(module, "expert_cap"):
+            continue
+        layer_idx = getattr(module, "layer_idx", None)
+        if layer_idx is None:
+            continue
+        try:
+            if int(layer_idx) not in moe_layers:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if top_k is None and hasattr(module, "top_k"):
+            try:
+                candidate = int(getattr(module, "top_k"))
+                if candidate > 0:
+                    top_k = candidate
+            except (TypeError, ValueError):
+                pass
+        if num_experts is None and hasattr(module, "num_experts"):
+            try:
+                candidate = int(getattr(module, "num_experts"))
+                if candidate > 0:
+                    num_experts = candidate
+            except (TypeError, ValueError):
+                pass
+        if top_k is not None and num_experts is not None:
+            break
+    return {
+        "moe_layers": moe_layers,
+        "schedule_length": schedule_length,
+        "top_k": top_k,
+        "num_experts": num_experts,
+    }
+
+
+def _resolve_cap_value(
+    params: Dict[str, Any],
+    label: str,
+    target_avg: int,
+    ctx: Dict[str, Any],
+) -> float:
+    value_key = f"cap_{label}"
+    scale_key = f"{value_key}_scale"
+    min_key = f"{value_key}_min"
+    max_key = f"{value_key}_max"
+
+    value: Optional[float] = None
+    if value_key in params:
+        try:
+            value = float(params[value_key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{value_key} must be numeric") from exc
+    elif scale_key in params:
+        try:
+            scale = float(params[scale_key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{scale_key} must be numeric") from exc
+        value = scale * float(target_avg)
+    else:
+        raise ValueError(
+            f"Tapered shape requires either '{value_key}' or '{scale_key}' to be specified"
+        )
+
+    if value <= 0:
+        raise ValueError(f"{value_key} must be positive after applying scale")
+
+    min_cap = params.get(min_key)
+    max_cap = params.get(max_key)
+    top_k = ctx.get("top_k")
+    num_experts = ctx.get("num_experts")
+    if min_cap is None and top_k is not None:
+        min_cap = float(top_k)
+    if max_cap is None and num_experts is not None:
+        max_cap = float(num_experts)
+
+    if min_cap is not None:
+        try:
+            min_cap = float(min_cap)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{min_key} must be numeric") from exc
+        value = max(value, min_cap)
+    if max_cap is not None:
+        try:
+            max_cap = float(max_cap)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{max_key} must be numeric") from exc
+        value = min(value, max_cap)
+
+    if value <= 0:
+        raise ValueError(f"Resolved {value_key} is non-positive; check scale/min/max settings")
+
+    return value
+
+
+def _quantize_caps(values: List[float], target_total: int, min_cap: Optional[int], max_cap: Optional[int]) -> List[int]:
+    if not values:
+        raise ValueError("No values provided for cap quantization")
+    floors = [math.floor(v) for v in values]
+    remainders = [v - f for v, f in zip(values, floors)]
+    diff = int(round(target_total - sum(floors)))
+    if diff > 0:
+        order = sorted(range(len(floors)), key=lambda i: remainders[i], reverse=True)
+        idx = 0
+        while diff > 0:
+            target_idx = order[idx % len(order)]
+            floors[target_idx] += 1
+            diff -= 1
+            idx += 1
+    elif diff < 0:
+        order = sorted(range(len(floors)), key=lambda i: remainders[i])
+        idx = 0
+        while diff < 0:
+            target_idx = order[idx % len(order)]
+            floors[target_idx] -= 1
+            diff += 1
+            idx += 1
+
+    for value in floors:
+        if min_cap is not None and value < min_cap:
+            raise ValueError(
+                f"Generated cap {value} is below top_k={min_cap}. Adjust shape parameters or target."
+            )
+        if max_cap is not None and value > max_cap:
+            raise ValueError(
+                f"Generated cap {value} exceeds num_experts={max_cap}. Adjust shape parameters or target."
+            )
+    if sum(floors) != target_total:
+        raise ValueError("Unable to match target average after quantization; try different parameters.")
+    return floors
+
+
+def _tapered_caps(target_avg: int, ctx: Dict[str, Any], params: Dict[str, Any]) -> List[int]:
+    required = ["k_head", "k_tail"]
+    missing = [key for key in required if key not in params]
+    if missing:
+        raise ValueError(f"Tapered shape requires parameters: {', '.join(missing)}")
+    try:
+        k_head = int(params["k_head"])
+        k_tail = int(params["k_tail"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("k_head and k_tail must be integers") from exc
+    for label, value in ("k_head", k_head), ("k_tail", k_tail):
+        if value < 0:
+            raise ValueError(f"{label} must be non-negative")
+
+    ramp_width = params.get("ramp_width", 0)
+    try:
+        ramp_width = int(ramp_width)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ramp_width must be an integer") from exc
+    if ramp_width < 0:
+        raise ValueError("ramp_width must be non-negative")
+
+    layer_count = len(ctx["moe_layers"])
+    head_layers = min(k_head, layer_count)
+    tail_layers = min(k_tail, max(layer_count - head_layers, 0))
+    if head_layers + tail_layers > layer_count:
+        raise ValueError("k_head + k_tail exceeds number of MoE layers")
+    middle_layers = layer_count - head_layers - tail_layers
+    effective_ramp = 0
+    if middle_layers > 0 and ramp_width > 0:
+        effective_ramp = min(ramp_width, middle_layers // 2)
+    plateau_layers = middle_layers - 2 * effective_ramp
+    if plateau_layers < 0:
+        plateau_layers = 0
+
+    cap_head = _resolve_cap_value(params, "head", target_avg, ctx)
+    cap_tail = _resolve_cap_value(params, "tail", target_avg, ctx)
+
+    target_total = target_avg * layer_count
+    head_coeff = head_layers + effective_ramp / 2.0
+    tail_coeff = tail_layers + effective_ramp / 2.0
+    mid_coeff = plateau_layers + effective_ramp
+    numerator = target_total - (cap_head * head_coeff + cap_tail * tail_coeff)
+    if mid_coeff <= 0:
+        if abs(numerator) > 1e-6:
+            raise ValueError(
+                "Tapered parameters cannot satisfy the requested average (no middle layers available)."
+            )
+        cap_mid = None
+    else:
+        cap_mid = numerator / mid_coeff
+        if cap_mid <= 0:
+            raise ValueError("Derived cap_mid is non-positive; adjust parameters.")
+
+    def _ramp_values(start: float, end: float, count: int) -> List[float]:
+        if count <= 0:
+            return []
+        step = (end - start) / (count + 1)
+        return [start + step * (idx + 1) for idx in range(count)]
+
+    raw_caps: List[float] = []
+    raw_caps.extend([float(cap_head)] * head_layers)
+    if effective_ramp > 0 and cap_mid is not None:
+        raw_caps.extend(_ramp_values(float(cap_head), float(cap_mid), effective_ramp))
+    if plateau_layers > 0 and cap_mid is not None:
+        raw_caps.extend([float(cap_mid)] * plateau_layers)
+    if effective_ramp > 0 and cap_mid is not None:
+        raw_caps.extend(_ramp_values(float(cap_mid), float(cap_tail), effective_ramp))
+    raw_caps.extend([float(cap_tail)] * tail_layers)
+
+    if len(raw_caps) != layer_count:
+        raise ValueError("Internal error: tapered schedule length mismatch")
+    if not raw_caps:
+        raise ValueError("Tapered schedule produced no caps")
+
+    min_cap = ctx.get("top_k")
+    max_cap = ctx.get("num_experts")
+    return _quantize_caps(raw_caps, target_total, min_cap, max_cap)
+
+
+def _linear_caps(target_avg: int, ctx: Dict[str, Any], params: Dict[str, Any]) -> List[int]:
+    required = ["cap_min", "cap_max"]
+    missing = [key for key in required if key not in params]
+    if missing:
+        raise ValueError(f"Linear shape requires parameters: {', '.join(missing)}")
+    try:
+        cap_min = float(params["cap_min"])
+        cap_max = float(params["cap_max"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Linear parameters must be numeric") from exc
+    if cap_min <= 0 or cap_max <= 0:
+        raise ValueError("cap_min and cap_max must be positive")
+    if cap_max < cap_min:
+        raise ValueError("cap_max must be greater than or equal to cap_min")
+
+    layer_count = len(ctx["moe_layers"])
+    if layer_count == 0:
+        raise ValueError("No MoE layers found for linear schedule")
+
+    if layer_count == 1:
+        raw_caps = [cap_max]
+    else:
+        center = (layer_count - 1) / 2.0
+        span = cap_max - cap_min
+        raw_caps = [cap_min + span * (abs(idx - center) / center if center else 0.0) for idx in range(layer_count)]
+
+    target_total = target_avg * layer_count
+    raw_sum = sum(raw_caps)
+    if raw_sum <= 0:
+        raise ValueError("Linear schedule produced non-positive total")
+    scale = target_total / raw_sum
+    scaled_caps = [value * scale for value in raw_caps]
+
+    min_cap = ctx.get("top_k")
+    max_cap = ctx.get("num_experts")
+    return _quantize_caps(scaled_caps, target_total, min_cap, max_cap)
+
+
+def build_cap_shape_schedule(
+    model: EaModel,
+    shape: str,
+    target: Optional[float],
+    config: Optional[str],
+) -> Tuple[List[Optional[int]], Dict[str, Any]]:
+    shape_key = (shape or "").strip().lower()
+    if shape_key not in {"flat", "tapered", "linear"}:
+        raise ValueError(f"Unsupported cap shape '{shape}'. Choose from flat, tapered, or linear.")
+
+    cap_value = _validate_cap_target(target)
+    params = _parse_cap_shape_config(config)
+    ctx = _collect_moe_context(model)
+    layer_count = len(ctx["moe_layers"])
+    if layer_count == 0:
+        raise ValueError("Cap shape scheduling requires at least one MoE layer.")
+
+    if shape_key == "flat":
+        per_layer_caps = [cap_value] * layer_count
+    elif shape_key == "tapered":
+        per_layer_caps = _tapered_caps(cap_value, ctx, params)
+    elif shape_key == "linear":
+        per_layer_caps = _linear_caps(cap_value, ctx, params)
+    else:  # pragma: no cover - guarded above
+        raise ValueError(f"Unhandled cap shape '{shape_key}'")
+
+    schedule_length = ctx["schedule_length"]
+    caps: List[Optional[int]] = [None] * schedule_length
+    for layer_idx, cap in zip(ctx["moe_layers"], per_layer_caps):
+        if layer_idx < 0 or layer_idx >= schedule_length:
+            raise ValueError(
+                f"MoE layer index {layer_idx} is outside the supported range [0, {schedule_length})."
+            )
+        caps[layer_idx] = int(cap)
+
+    metadata = {
+        "shape": shape_key,
+        "target_avg_cap": float(cap_value),
+        "moe_layers": ctx["moe_layers"],
+        "schedule_length": schedule_length,
+        "params": params,
+        "final_moe_caps": per_layer_caps,
+        "achieved_avg_cap": sum(per_layer_caps) / layer_count,
+        "cap_bounds": {
+            "top_k": ctx.get("top_k"),
+            "num_experts": ctx.get("num_experts"),
+        },
+    }
+    return caps, metadata
+
+
+class GradualCapController:
+    """Smoothly adjust the cap toward a target acceptance length."""
+
+    def __init__(
+        self,
+        *,
+        low_cap: int,
+        high_cap: int,
+        step: int,
+        target_accept: float,
+        band: float,
+        alpha: float,
+    ) -> None:
+        self.low_cap = int(low_cap)
+        self.high_cap = int(high_cap)
+        self.step = max(1, int(step))
+        self.target_accept = float(target_accept)
+        self.band = max(0.0, float(band))
+        self.alpha = min(1.0, max(0.0, float(alpha)))
+        self.current_cap = self.low_cap
+        self.ema_accept = self.target_accept
+        self.total_iterations = 0
+        self.cap_hist: Dict[int, int] = {}
+        self.wave_log: List[Dict[str, Any]] = []
+        self.last_summary: Dict[str, Any] = {}
+
+    def on_sequence_start(self) -> None:
+        self.current_cap = self.low_cap
+        self.ema_accept = self.target_accept
+        self.seq_iterations = 0
+        self.seq_cap_sum = 0.0
+        self.seq_cap_hist: Dict[int, int] = {}
+        self.wave_log = []
+
+    def _record_cap(self, cap: int) -> None:
+        self.cap_hist[cap] = self.cap_hist.get(cap, 0) + 1
+        self.seq_cap_hist[cap] = self.seq_cap_hist.get(cap, 0) + 1
+
+    def on_iteration_end(
+        self,
+        iteration_idx: int,
+        metrics: Dict[str, Any],
+    ) -> Optional[int]:
+        cap_used = int(metrics.get("cap") or self.current_cap)
+        accept = float(metrics.get("accept_length") or 0.0)
+        self.total_iterations += 1
+        self.seq_iterations += 1
+        self.seq_cap_sum += cap_used
+        self._record_cap(cap_used)
+
+        if self.alpha > 0:
+            self.ema_accept = (1 - self.alpha) * self.ema_accept + self.alpha * accept
+        else:
+            self.ema_accept = accept
+
+        desired_cap = self.current_cap
+        if self.ema_accept < self.target_accept - self.band and self.current_cap < self.high_cap:
+            desired_cap = min(self.high_cap, self.current_cap + self.step)
+        elif self.ema_accept > self.target_accept + self.band and self.current_cap > self.low_cap:
+            desired_cap = max(self.low_cap, self.current_cap - self.step)
+
+        log_entry = {
+            "iteration": iteration_idx,
+            "cap": cap_used,
+            "next_cap": desired_cap,
+            "accept_length": accept,
+            "ema_accept": self.ema_accept,
+        }
+        self.wave_log.append(log_entry)
+
+        if desired_cap != self.current_cap:
+            self.current_cap = desired_cap
+            return desired_cap
+        return None
+
+    def on_sequence_end(self) -> None:
+        seq_avg_cap = (
+            self.seq_cap_sum / self.seq_iterations if self.seq_iterations else float(self.low_cap)
+        )
+        total_cap_count = sum(self.cap_hist.values()) or 1
+        total_avg_cap = sum(cap * count for cap, count in self.cap_hist.items()) / total_cap_count
+        self.last_summary = {
+            "low_cap": self.low_cap,
+            "high_cap": self.high_cap,
+            "sequence_avg_cap": seq_avg_cap,
+            "sequence_iterations": self.seq_iterations,
+            "sequence_cap_hist": dict(self.seq_cap_hist),
+            "total_avg_cap": total_avg_cap,
+            "total_cap_hist": dict(self.cap_hist),
+            "target_accept": self.target_accept,
+            "ema_accept_final": self.ema_accept,
+        }
+
+    def summary(self) -> Dict[str, Any]:
+        if not self.last_summary:
+            self.on_sequence_end()
+        return dict(self.last_summary)
+
+    def pop_wave_log(self) -> List[Dict[str, Any]]:
+        log = list(self.wave_log)
+        self.wave_log.clear()
+        return log
 
 
 @torch.inference_mode()
@@ -118,9 +608,53 @@ def run_evaluation(
         device_map="auto",
     )
     model.eval()
-    model.set_expert_cap(args.expert_cap)
-    if args.expert_cap is not None:
-        print(f"Applying expert cap: {args.expert_cap}")
+    cap_shape_metadata: Optional[Dict[str, Any]] = None
+    adaptive_enabled = False
+    adaptive_controller: Optional[GradualCapController] = None
+    if args.cap_schedule_file:
+        caps = load_cap_schedule(args.cap_schedule_file, args.cap_schedule_target)
+        model.set_expert_cap_schedule(caps)
+        print(
+            f"Applying cap schedule {args.cap_schedule_file} "
+            f"(target={args.cap_schedule_target}, layers={len(caps)})"
+        )
+    elif args.cap_shape:
+        caps, metadata = build_cap_shape_schedule(
+            model,
+            args.cap_shape,
+            args.cap_schedule_target,
+            args.cap_shape_config,
+        )
+        model.set_expert_cap_schedule(caps)
+        num_layers = len(metadata.get("moe_layers", []))
+        print(
+            f"Applying {args.cap_shape} cap schedule (target={metadata['target_avg_cap']}, "
+            f"moe_layers={num_layers}, params={metadata.get('params', {})})"
+        )
+        cap_shape_metadata = metadata
+        setattr(args, "cap_shape_metadata", metadata)
+    else:
+        if use_eagle and args.adaptive_cap_low is not None and args.adaptive_cap_high is not None:
+            adaptive_enabled = True
+            model.set_expert_cap(args.adaptive_cap_low)
+            print(
+                "Adaptive expert cap enabled: "
+                f"low={args.adaptive_cap_low}, high={args.adaptive_cap_high}, "
+                f"target_accept={args.adaptive_target_accept}, band={args.adaptive_band}, "
+                f"step={args.adaptive_step}, alpha={args.adaptive_alpha}"
+            )
+            adaptive_controller = GradualCapController(
+                low_cap=args.adaptive_cap_low,
+                high_cap=args.adaptive_cap_high,
+                step=args.adaptive_step,
+                target_accept=args.adaptive_target_accept,
+                band=args.adaptive_band,
+                alpha=args.adaptive_alpha,
+            )
+        else:
+            model.set_expert_cap(args.expert_cap)
+            if args.expert_cap is not None:
+                print(f"Applying expert cap: {args.expert_cap}")
     oracle_enabled = False
     if args.oracle_trace_file:
         oracle_enabled = model.configure_oracle(
@@ -204,6 +738,7 @@ def run_evaluation(
         for turn_idx, turn in enumerate(question["turns"]):
             print(f"    Turn {turn_idx + 1}/{len(question['turns'])}...", end=" ", flush=True)
 
+            wave_metrics: List[Dict[str, Any]] = []
             if use_chat_template:
                 messages.append({"role": "user", "content": turn})
                 # For Qwen3, disable thinking mode for faster, more direct responses
@@ -306,6 +841,9 @@ def run_evaluation(
                 oracle_turn_active = model.start_oracle_turn(question.get("question_id"), turn_idx)
 
             if use_eagle:
+                controller_for_turn = adaptive_controller if adaptive_enabled else None
+                if controller_for_turn is not None:
+                    controller_for_turn.on_sequence_start()
                 output_ids, new_tokens, iterations, accept_lengths, iteration_traces = model.eagenerate(
                     torch.as_tensor(input_ids).to(model.base_model.device),
                     temperature=temperature,
@@ -314,6 +852,7 @@ def run_evaluation(
                     is_llama3=is_llama3,
                     collect_expert_traces=args.collect_expert_traces,
                     trace_schema=args.trace_schema,
+                    adaptive_controller=controller_for_turn,
                 )
             else:
                 # Baseline: use naivegenerate (optimized AR decoding)
@@ -403,6 +942,12 @@ def run_evaluation(
                         turn_stats['expert_traces'] = []
                     else:
                         turn_stats['expert_traces'] = iteration_traces
+                if adaptive_enabled and controller_for_turn is not None:
+                    summary = controller_for_turn.summary()
+                    turn_stats['adaptive_cap'] = summary
+                    wave_metrics = controller_for_turn.pop_wave_log()
+                    if wave_metrics:
+                        turn_stats['wave_metrics'] = wave_metrics
 
             turns_stats.append(turn_stats)
 
@@ -516,6 +1061,26 @@ if __name__ == "__main__":
                         help="Trace export format when collecting expert traces (analysis = full tree, training = lean node features)")
     parser.add_argument("--expert-cap", type=int, default=None,
                         help="Limit the number of experts evaluated per layer (applies to base/verify model)")
+    parser.add_argument("--cap-schedule-file", type=str, default=None,
+                        help="Path to JSON schedule produced by allocate_layer_caps.py")
+    parser.add_argument("--cap-schedule-target", type=float, default=None,
+                        help="Target average cap to load from the schedule file")
+    parser.add_argument("--cap-shape", type=str, choices=["flat", "tapered", "linear"], default=None,
+                        help="Generate per-layer caps using a preset shape")
+    parser.add_argument("--cap-shape-config", type=str, default=None,
+                        help="JSON object with shape-specific parameters (e.g., '{\"k_head\":2,...}')")
+    parser.add_argument("--adaptive-cap-low", type=int, default=None,
+                        help="Enable gradual adaptive capping with this minimum cap")
+    parser.add_argument("--adaptive-cap-high", type=int, default=None,
+                        help="Maximum cap the controller may reach")
+    parser.add_argument("--adaptive-step", type=int, default=2,
+                        help="Cap increment/decrement applied when the controller reacts")
+    parser.add_argument("--adaptive-target-accept", type=float, default=3.0,
+                        help="Target acceptance length the controller tries to maintain")
+    parser.add_argument("--adaptive-band", type=float, default=0.3,
+                        help="Deadband around the target acceptance to avoid flapping")
+    parser.add_argument("--adaptive-alpha", type=float, default=0.2,
+                        help="EMA smoothing factor for acceptance length (0 disables smoothing)")
     parser.add_argument("--oracle-trace-file", type=str, default=None,
                         help="Path to a JSONL answer log containing expert_traces for oracle replay pruning")
     parser.add_argument("--oracle-choice-index", type=int, default=0,
@@ -527,6 +1092,38 @@ if __name__ == "__main__":
 
     if args.trace_schema == "training" and not args.collect_expert_traces:
         parser.error("--trace-schema=training requires --collect-expert-traces")
+    if args.cap_schedule_file and args.cap_schedule_target is None:
+        parser.error("--cap-schedule-target is required when --cap-schedule-file is provided")
+    if args.cap_schedule_file and args.expert_cap is not None:
+        parser.error("Use either --expert-cap or --cap-schedule-file, not both")
+    if args.cap_shape and args.cap_schedule_file:
+        parser.error("Use either --cap-shape or --cap-schedule-file, not both")
+    if args.cap_shape and args.expert_cap is not None:
+        parser.error("Use either --cap-shape or --expert-cap, not both")
+    if args.cap_shape and args.cap_schedule_target is None:
+        parser.error("--cap-schedule-target is required when --cap-shape is provided")
+    if args.cap_shape_config and not args.cap_shape:
+        parser.error("--cap-shape-config requires --cap-shape")
+
+    adaptive_low = args.adaptive_cap_low
+    adaptive_high = args.adaptive_cap_high
+    if (adaptive_low is None) ^ (adaptive_high is None):
+        parser.error("--adaptive-cap-low and --adaptive-cap-high must be provided together")
+    if adaptive_low is not None:
+        if args.cap_schedule_file or args.cap_shape:
+            parser.error("Adaptive cap cannot be combined with --cap-schedule-file or --cap-shape")
+        if adaptive_high <= adaptive_low:
+            parser.error("--adaptive-cap-high must be greater than --adaptive-cap-low")
+        if not args.use_eagle:
+            parser.error("Adaptive cap requires --use-eagle")
+        if args.adaptive_step <= 0:
+            parser.error("--adaptive-step must be positive")
+        if args.adaptive_alpha < 0.0 or args.adaptive_alpha > 1.0:
+            parser.error("--adaptive-alpha must be in [0, 1]")
+        if args.adaptive_target_accept <= 0:
+            parser.error("--adaptive-target-accept must be positive")
+        if args.adaptive_band < 0:
+            parser.error("--adaptive-band must be non-negative")
 
     # Validate arguments
     if args.use_eagle and not args.ea_model_path:

@@ -406,6 +406,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                         )
         self._last_cap_shortlist = shortlist_indices
 
+        pre_cap_selected = None
+        pre_cap_weights = None
+        if self.trace_recorder is not None:
+            pre_cap_selected = torch.topk(router_logits, self.top_k, dim=-1).indices
+            pre_cap_weights = routing_probs_full.gather(-1, pre_cap_selected)
+
+        precap_shortlist = None
+        if self.trace_recorder is not None and shortlist_indices is not None:
+            precap_shortlist = shortlist_indices.detach().to("cpu").tolist()
+
         _, selected_experts = torch.topk(masked_logits, self.top_k, dim=-1)
         routing_weights = routing_probs_full.gather(-1, selected_experts)
 
@@ -420,9 +430,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             try:
                 experts_per_token = selected_experts.view(batch_size, sequence_length, self.top_k)
                 weights_per_token = routing_weights.view(batch_size, sequence_length, self.top_k)
+                if pre_cap_selected is not None and pre_cap_weights is not None:
+                    full_experts_per_token = pre_cap_selected.view(batch_size, sequence_length, self.top_k)
+                    full_weights_per_token = pre_cap_weights.view(batch_size, sequence_length, self.top_k)
+                else:
+                    full_experts_per_token = experts_per_token
+                    full_weights_per_token = weights_per_token
             except RuntimeError:
                 experts_per_token = selected_experts.view(1, -1, self.top_k)
                 weights_per_token = routing_weights.view(1, -1, self.top_k)
+                if pre_cap_selected is not None and pre_cap_weights is not None:
+                    full_experts_per_token = pre_cap_selected.view(1, -1, self.top_k)
+                    full_weights_per_token = pre_cap_weights.view(1, -1, self.top_k)
+                else:
+                    full_experts_per_token = experts_per_token
+                    full_weights_per_token = weights_per_token
             shortlist_payload = (
                 self._last_cap_shortlist.detach().to("cpu").tolist()
                 if self._last_cap_shortlist is not None
@@ -433,6 +455,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 experts_per_token.detach(),
                 weights_per_token.detach(),
                 shortlist=shortlist_payload,
+                full_experts=full_experts_per_token.detach(),
+                full_weights=full_weights_per_token.detach(),
+                precap_shortlist=precap_shortlist,
             )
 
         final_hidden_states = torch.zeros(
