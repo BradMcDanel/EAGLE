@@ -18,10 +18,12 @@ import math
 import os
 import sys
 import time
+from collections import deque
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -455,43 +457,87 @@ def build_cap_shape_schedule(
     return caps, metadata
 
 
-class GradualCapController:
-    """Smoothly adjust the cap toward a target acceptance length."""
+class AdaptiveCapController:
+    """Maintain expert-cap speedups while respecting an acceptance target."""
 
     def __init__(
         self,
         *,
-        low_cap: int,
-        high_cap: int,
-        step: int,
+        min_cap: int,
+        max_cap: int,
         target_accept: float,
-        band: float,
-        alpha: float,
+        tolerance: float,
+        step: int,
+        window: int,
     ) -> None:
-        self.low_cap = int(low_cap)
-        self.high_cap = int(high_cap)
+        if max_cap <= min_cap:
+            raise ValueError("max_cap must be greater than min_cap for adaptive control.")
+
+        self.min_cap = int(min_cap)
+        self.max_cap = int(max_cap)
         self.step = max(1, int(step))
         self.target_accept = float(target_accept)
-        self.band = max(0.0, float(band))
-        self.alpha = min(1.0, max(0.0, float(alpha)))
-        self.current_cap = self.low_cap
-        self.ema_accept = self.target_accept
+        self.tolerance = max(0.0, float(tolerance))
+        self.window = max(1, int(window))
+        self.cooldown_steps = self.window
+
+        self.current_cap = self.min_cap
+        self.accept_window: Deque[float] = deque(maxlen=self.window)
+        self.cooldown = 0
+
         self.total_iterations = 0
         self.cap_hist: Dict[int, int] = {}
+        self.adjustments = 0
+
+        # Sequence-scoped stats (reset every on_sequence_start)
+        self.seq_iterations = 0
+        self.seq_cap_sum = 0.0
+        self.seq_accept_sum = 0.0
+        self.seq_cap_hist: Dict[int, int] = {}
+        self.seq_adjustments = 0
         self.wave_log: List[Dict[str, Any]] = []
         self.last_summary: Dict[str, Any] = {}
 
     def on_sequence_start(self) -> None:
-        self.current_cap = self.low_cap
-        self.ema_accept = self.target_accept
+        self.current_cap = self.min_cap
+        self.accept_window.clear()
+        self.cooldown = 0
         self.seq_iterations = 0
         self.seq_cap_sum = 0.0
-        self.seq_cap_hist: Dict[int, int] = {}
+        self.seq_accept_sum = 0.0
+        self.seq_cap_hist = {}
+        self.seq_adjustments = 0
         self.wave_log = []
 
     def _record_cap(self, cap: int) -> None:
         self.cap_hist[cap] = self.cap_hist.get(cap, 0) + 1
         self.seq_cap_hist[cap] = self.seq_cap_hist.get(cap, 0) + 1
+
+    def _build_summary(self) -> Dict[str, Any]:
+        seq_avg_cap = (
+            self.seq_cap_sum / self.seq_iterations if self.seq_iterations else float(self.current_cap)
+        )
+        seq_avg_accept = (
+            self.seq_accept_sum / self.seq_iterations if self.seq_iterations else 0.0
+        )
+        return {
+            "min_cap": self.min_cap,
+            "max_cap": self.max_cap,
+            "step": self.step,
+            "target_accept": self.target_accept,
+            "tolerance": self.tolerance,
+            "window": self.window,
+            "current_cap": self.current_cap,
+            "sequence_iterations": self.seq_iterations,
+            "sequence_avg_cap": seq_avg_cap,
+            "sequence_avg_accept": seq_avg_accept,
+            "sequence_cap_hist": dict(self.seq_cap_hist),
+            "sequence_adjustments": self.seq_adjustments,
+            "total_iterations": self.total_iterations,
+            "total_cap_hist": dict(self.cap_hist),
+            "total_adjustments": self.adjustments,
+            "recent_accept_window": list(self.accept_window),
+        }
 
     def on_iteration_end(
         self,
@@ -500,57 +546,74 @@ class GradualCapController:
     ) -> Optional[int]:
         cap_used = int(metrics.get("cap") or self.current_cap)
         accept = float(metrics.get("accept_length") or 0.0)
+
         self.total_iterations += 1
         self.seq_iterations += 1
         self.seq_cap_sum += cap_used
+        self.seq_accept_sum += accept
         self._record_cap(cap_used)
 
-        if self.alpha > 0:
-            self.ema_accept = (1 - self.alpha) * self.ema_accept + self.alpha * accept
-        else:
-            self.ema_accept = accept
+        self.accept_window.append(accept)
+        avg_window = sum(self.accept_window) / len(self.accept_window)
 
-        desired_cap = self.current_cap
-        if self.ema_accept < self.target_accept - self.band and self.current_cap < self.high_cap:
-            desired_cap = min(self.high_cap, self.current_cap + self.step)
-        elif self.ema_accept > self.target_accept + self.band and self.current_cap > self.low_cap:
-            desired_cap = max(self.low_cap, self.current_cap - self.step)
+        lower_bound = self.target_accept - self.tolerance
+        upper_bound = self.target_accept + self.tolerance
+        urgent_lower_bound = lower_bound - self.tolerance
+        urgent_upper_bound = upper_bound + self.tolerance
+
+        requested_cap: Optional[int] = None
+        action = "hold"
+
+        # Urgent adjustments react immediately to extreme deviations.
+        if accept < urgent_lower_bound and self.current_cap < self.max_cap:
+            requested_cap = min(self.max_cap, self.current_cap + self.step)
+            action = "raise"
+        elif accept > urgent_upper_bound and self.current_cap > self.min_cap:
+            requested_cap = max(self.min_cap, self.current_cap - self.step)
+            action = "lower"
+        else:
+            if self.cooldown > 0:
+                self.cooldown -= 1
+            if self.cooldown == 0 and len(self.accept_window) == self.window:
+                if avg_window < lower_bound and self.current_cap < self.max_cap:
+                    requested_cap = min(self.max_cap, self.current_cap + self.step)
+                    action = "raise"
+                elif avg_window > upper_bound and self.current_cap > self.min_cap:
+                    requested_cap = max(self.min_cap, self.current_cap - self.step)
+                    action = "lower"
+
+        if requested_cap is not None and requested_cap == self.current_cap:
+            requested_cap = None
+            action = "hold"
+
+        if requested_cap is not None:
+            self.current_cap = requested_cap
+            self.accept_window.clear()
+            self.cooldown = self.cooldown_steps
+            self.adjustments += 1
+            self.seq_adjustments += 1
 
         log_entry = {
             "iteration": iteration_idx,
             "cap": cap_used,
-            "next_cap": desired_cap,
+            "next_cap": self.current_cap,
             "accept_length": accept,
-            "ema_accept": self.ema_accept,
+            "window_avg_accept": avg_window,
+            "action": action,
+            "cooldown": self.cooldown,
+            "iteration_time": metrics.get("iteration_time"),
+            "margin": metrics.get("margin"),
         }
         self.wave_log.append(log_entry)
 
-        if desired_cap != self.current_cap:
-            self.current_cap = desired_cap
-            return desired_cap
-        return None
+        return self.current_cap if requested_cap is not None else None
 
     def on_sequence_end(self) -> None:
-        seq_avg_cap = (
-            self.seq_cap_sum / self.seq_iterations if self.seq_iterations else float(self.low_cap)
-        )
-        total_cap_count = sum(self.cap_hist.values()) or 1
-        total_avg_cap = sum(cap * count for cap, count in self.cap_hist.items()) / total_cap_count
-        self.last_summary = {
-            "low_cap": self.low_cap,
-            "high_cap": self.high_cap,
-            "sequence_avg_cap": seq_avg_cap,
-            "sequence_iterations": self.seq_iterations,
-            "sequence_cap_hist": dict(self.seq_cap_hist),
-            "total_avg_cap": total_avg_cap,
-            "total_cap_hist": dict(self.cap_hist),
-            "target_accept": self.target_accept,
-            "ema_accept_final": self.ema_accept,
-        }
+        # Nothing to reset; capture summary for posterity.
+        self.last_summary = self._build_summary()
 
     def summary(self) -> Dict[str, Any]:
-        if not self.last_summary:
-            self.on_sequence_end()
+        self.last_summary = self._build_summary()
         return dict(self.last_summary)
 
     def pop_wave_log(self) -> List[Dict[str, Any]]:
@@ -610,7 +673,7 @@ def run_evaluation(
     model.eval()
     cap_shape_metadata: Optional[Dict[str, Any]] = None
     adaptive_enabled = False
-    adaptive_controller: Optional[GradualCapController] = None
+    adaptive_controller: Optional[AdaptiveCapController] = None
     if args.cap_schedule_file:
         caps = load_cap_schedule(args.cap_schedule_file, args.cap_schedule_target)
         model.set_expert_cap_schedule(caps)
@@ -634,22 +697,22 @@ def run_evaluation(
         cap_shape_metadata = metadata
         setattr(args, "cap_shape_metadata", metadata)
     else:
-        if use_eagle and args.adaptive_cap_low is not None and args.adaptive_cap_high is not None:
+        if use_eagle and args.adaptive_cap_min is not None and args.adaptive_cap_max is not None:
             adaptive_enabled = True
-            model.set_expert_cap(args.adaptive_cap_low)
+            model.set_expert_cap(args.adaptive_cap_min)
             print(
                 "Adaptive expert cap enabled: "
-                f"low={args.adaptive_cap_low}, high={args.adaptive_cap_high}, "
-                f"target_accept={args.adaptive_target_accept}, band={args.adaptive_band}, "
-                f"step={args.adaptive_step}, alpha={args.adaptive_alpha}"
+                f"min={args.adaptive_cap_min}, max={args.adaptive_cap_max}, "
+                f"target_accept={args.adaptive_target_accept}, tolerance={args.adaptive_tolerance}, "
+                f"step={args.adaptive_step}, window={args.adaptive_window}"
             )
-            adaptive_controller = GradualCapController(
-                low_cap=args.adaptive_cap_low,
-                high_cap=args.adaptive_cap_high,
+            adaptive_controller = AdaptiveCapController(
+                min_cap=args.adaptive_cap_min,
+                max_cap=args.adaptive_cap_max,
                 step=args.adaptive_step,
                 target_accept=args.adaptive_target_accept,
-                band=args.adaptive_band,
-                alpha=args.adaptive_alpha,
+                tolerance=args.adaptive_tolerance,
+                window=args.adaptive_window,
             )
         else:
             model.set_expert_cap(args.expert_cap)
@@ -1069,18 +1132,18 @@ if __name__ == "__main__":
                         help="Generate per-layer caps using a preset shape")
     parser.add_argument("--cap-shape-config", type=str, default=None,
                         help="JSON object with shape-specific parameters (e.g., '{\"k_head\":2,...}')")
-    parser.add_argument("--adaptive-cap-low", type=int, default=None,
-                        help="Enable gradual adaptive capping with this minimum cap")
-    parser.add_argument("--adaptive-cap-high", type=int, default=None,
+    parser.add_argument("--adaptive-cap-min", type=int, default=None,
+                        help="Enable adaptive expert capping with this minimum cap")
+    parser.add_argument("--adaptive-cap-max", type=int, default=None,
                         help="Maximum cap the controller may reach")
     parser.add_argument("--adaptive-step", type=int, default=2,
                         help="Cap increment/decrement applied when the controller reacts")
-    parser.add_argument("--adaptive-target-accept", type=float, default=3.0,
-                        help="Target acceptance length the controller tries to maintain")
-    parser.add_argument("--adaptive-band", type=float, default=0.3,
-                        help="Deadband around the target acceptance to avoid flapping")
-    parser.add_argument("--adaptive-alpha", type=float, default=0.2,
-                        help="EMA smoothing factor for acceptance length (0 disables smoothing)")
+    parser.add_argument("--adaptive-target-accept", type=float, default=None,
+                        help="Acceptance length the controller tries to maintain")
+    parser.add_argument("--adaptive-tolerance", type=float, default=0.2,
+                        help="Deadband around the target acceptance to avoid oscillation")
+    parser.add_argument("--adaptive-window", type=int, default=4,
+                        help="Number of iterations to average acceptance over before adjusting")
     parser.add_argument("--oracle-trace-file", type=str, default=None,
                         help="Path to a JSONL answer log containing expert_traces for oracle replay pruning")
     parser.add_argument("--oracle-choice-index", type=int, default=0,
@@ -1105,25 +1168,25 @@ if __name__ == "__main__":
     if args.cap_shape_config and not args.cap_shape:
         parser.error("--cap-shape-config requires --cap-shape")
 
-    adaptive_low = args.adaptive_cap_low
-    adaptive_high = args.adaptive_cap_high
-    if (adaptive_low is None) ^ (adaptive_high is None):
-        parser.error("--adaptive-cap-low and --adaptive-cap-high must be provided together")
-    if adaptive_low is not None:
+    adaptive_min = args.adaptive_cap_min
+    adaptive_max = args.adaptive_cap_max
+    if (adaptive_min is None) ^ (adaptive_max is None):
+        parser.error("--adaptive-cap-min and --adaptive-cap-max must be provided together")
+    if adaptive_min is not None:
         if args.cap_schedule_file or args.cap_shape:
             parser.error("Adaptive cap cannot be combined with --cap-schedule-file or --cap-shape")
-        if adaptive_high <= adaptive_low:
-            parser.error("--adaptive-cap-high must be greater than --adaptive-cap-low")
+        if adaptive_max <= adaptive_min:
+            parser.error("--adaptive-cap-max must be greater than --adaptive-cap-min")
         if not args.use_eagle:
             parser.error("Adaptive cap requires --use-eagle")
         if args.adaptive_step <= 0:
             parser.error("--adaptive-step must be positive")
-        if args.adaptive_alpha < 0.0 or args.adaptive_alpha > 1.0:
-            parser.error("--adaptive-alpha must be in [0, 1]")
-        if args.adaptive_target_accept <= 0:
-            parser.error("--adaptive-target-accept must be positive")
-        if args.adaptive_band < 0:
-            parser.error("--adaptive-band must be non-negative")
+        if args.adaptive_target_accept is None or args.adaptive_target_accept <= 0:
+            parser.error("--adaptive-target-accept must be provided and positive")
+        if args.adaptive_tolerance < 0:
+            parser.error("--adaptive-tolerance must be non-negative")
+        if args.adaptive_window <= 0:
+            parser.error("--adaptive-window must be positive")
 
     # Validate arguments
     if args.use_eagle and not args.ea_model_path:
