@@ -127,7 +127,28 @@ def _normalize_completion(code: str) -> str:
     return body
 
 
-def _load_answers(answer_file: Path) -> List[_AnswerRecord]:
+def _load_questions(question_file: Path) -> Dict[int, str]:
+    """Load questions and extract function names to map question_id -> HumanEval task_id."""
+    question_to_function = {}
+    with question_file.open() as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            question_id = int(entry["question_id"])
+            # Extract function name from the prompt
+            prompt = entry["turns"][0] if "turns" in entry else ""
+            # Look for 'def function_name(' - use findall to get all, take last
+            # (HumanEval puts helper functions first, target function last)
+            matches = re.findall(r'\bdef\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', prompt)
+            if matches:
+                function_name = matches[-1]  # Take the last function definition
+                question_to_function[question_id] = function_name
+    return question_to_function
+
+
+def _load_answers(answer_file: Path, question_to_task: Dict[int, str]) -> List[_AnswerRecord]:
+    """Load answers and map to HumanEval task_ids using question mapping."""
     records: List[_AnswerRecord] = []
     with answer_file.open() as fh:
         for line in fh:
@@ -135,14 +156,21 @@ def _load_answers(answer_file: Path) -> List[_AnswerRecord]:
                 continue
             entry = json.loads(line)
             question_id = int(entry["question_id"])
-            turns: List[str] = entry["choices"][0].get("turns", [])
-            raw_text = turns[-1] if turns else ""
+            turns = entry["choices"][0]["turns"]
+            assert len(turns) > 0, f"No turns found for question {question_id}"
+            raw_text = turns[-1]
+
+            # Get the task_id from the mapping
+            assert question_id in question_to_task, \
+                f"Question {question_id} not found in question file mapping"
+            task_id = question_to_task[question_id]
+
             records.append(
                 _AnswerRecord(
                     question_id=question_id,
                     raw_text=raw_text,
                     sample={
-                        "task_id": f"HumanEval/{question_id}",
+                        "task_id": task_id,
                         "completion": "",
                     },
                 )
@@ -196,13 +224,27 @@ def score(
     output_path: Path,
     run_metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
-    answers = _load_answers(answer_file)
+    # Load questions to map question_id -> function name -> HumanEval task_id
+    question_to_function = _load_questions(question_file)
+
+    # Load all HumanEval problems and create reverse mapping: function name -> task_id
+    all_problems = read_problems(HUMAN_EVAL)
+    function_to_task = {p["entry_point"]: tid for tid, p in all_problems.items()}
+
+    # Create mapping: question_id -> HumanEval task_id
+    question_to_task = {}
+    for qid, func_name in question_to_function.items():
+        assert func_name in function_to_task, \
+            f"Function '{func_name}' from question {qid} not found in HumanEval dataset"
+        question_to_task[qid] = function_to_task[func_name]
+
+    # Load answers with proper task_id mapping
+    answers = _load_answers(answer_file, question_to_task)
     if not answers:
         raise ValueError(f"No answers found in {answer_file}")
 
     target_ids = {ans.sample["task_id"] for ans in answers}
 
-    all_problems = read_problems(HUMAN_EVAL)
     missing = sorted(task_id for task_id in target_ids if task_id not in all_problems)
     if missing:
         raise ValueError(f"Missing HumanEval tasks: {', '.join(missing)}")

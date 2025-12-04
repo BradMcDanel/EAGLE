@@ -1,0 +1,27 @@
+# Test sweep configuration for HumanEval
+# Small subset to validate the sweep infrastructure
+
+model:
+  base_path: "allenai/OLMoE-1B-7B-0125-Instruct"
+  eagle_path: "wantsleep/OLMoE_1B_7B_Eagle3"
+  gpus_per_run: 1
+
+datasets: [humaneval]
+
+# Test with 2 temperatures
+temperatures: [0.0, 1.0]
+
+# Test with 2 draft token settings
+draft_tokens: [31, 63]
+
+# Test both pruning strategies
+pruning_strategies: [substitution, truncation]
+
+# Test with budgets per selection mode
+expert_selection:
+  cardinality: [16, 32]
+  probability: [0.50, 0.60, 0.70, 0.80, 0.90]
+
+# Options
+num_samples: 5  # Only run 5 samples from dataset for testing
+overwrite: false  # Skip existing runs by default

@@ -4,7 +4,7 @@ import math
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -962,8 +962,10 @@ class EaModel(nn.Module):
         self.ea_layer.init_tree()
         self.oracle: Optional[OracleTracePruner] = None
         self._expert_cap: Optional[int] = None
-        self._expert_cap_schedule: Optional[List[Optional[int]]] = None
+        self._expert_cap_config: Optional[Dict[str, Any]] = None
+        self._expert_pruning_strategy: str = "substitution"
         self._cap_suspend_depth: int = 0
+        self._last_cap_usage_means: List[float] = []
         self._apply_expert_caps()
 
     def get_tokenizer(self):
@@ -1091,70 +1093,56 @@ class EaModel(nn.Module):
         self.oracle = pruner
         return bool(pruner.trace_map)
 
-    def _set_all_expert_caps(self, cap: Optional[int]) -> None:
+    def _set_all_expert_caps(self, cap: Optional[int], config: Optional[Dict[str, Any]]) -> None:
         effective_cap = None if cap is None else int(cap)
         for module in self.base_model.modules():
             if hasattr(module, "expert_cap"):
                 module.expert_cap = effective_cap
+            if hasattr(module, "expert_cap_config"):
+                module.expert_cap_config = None if config is None else dict(config)
+            if hasattr(module, "expert_pruning_strategy"):
+                module.expert_pruning_strategy = self._expert_pruning_strategy
 
     def _apply_expert_caps(self) -> None:
         if self._cap_suspend_depth > 0:
             return
-        schedule = self._expert_cap_schedule
-        if schedule is None:
-            self._set_all_expert_caps(self._expert_cap)
-            return
-        max_len = len(schedule)
-        for module in self.base_model.modules():
-            if not hasattr(module, "expert_cap"):
-                continue
-            layer_idx = getattr(module, "layer_idx", None)
-            cap = self._expert_cap
-            if layer_idx is not None and 0 <= int(layer_idx) < max_len:
-                override = schedule[int(layer_idx)]
-                if override is not None:
-                    cap = override
-            module.expert_cap = None if cap is None else int(cap)
+        self._set_all_expert_caps(self._expert_cap, self._expert_cap_config)
 
-    def set_expert_cap(self, cap: Optional[int]) -> None:
-        if cap is None:
-            self._expert_cap = None
-        else:
-            if cap <= 0:
-                self._expert_cap = None
-            else:
-                self._expert_cap = int(cap)
+    def set_expert_pruning_strategy(self, strategy: str) -> None:
+        """Set expert pruning strategy: 'substitution' or 'truncation'."""
+        assert strategy in ["substitution", "truncation"], f"Invalid pruning strategy: {strategy}"
+        self._expert_pruning_strategy = strategy
         if self._cap_suspend_depth == 0:
             self._apply_expert_caps()
 
-    def set_expert_cap_schedule(
-        self, schedule: Optional[Union[Sequence[Optional[int]], Dict[int, Optional[int]]]]
-    ) -> None:
-        if schedule is None:
-            self._expert_cap_schedule = None
-        else:
-            normalized: List[Optional[int]]
-            if isinstance(schedule, dict):
-                keys = [int(k) for k in schedule.keys()]
-                max_idx = max(keys) + 1 if keys else 0
-                normalized = [None] * max_idx
-                for raw_idx, raw_cap in schedule.items():
-                    idx = int(raw_idx)
-                    normalized[idx] = None if raw_cap is None else int(raw_cap)
-            else:
-                normalized = [None if cap is None else int(cap) for cap in schedule]
-            self._expert_cap_schedule = normalized
+    def set_expert_count_budget(self, budget: int) -> None:
+        """Set cardinality-based expert selection (fixed number of experts)."""
+        assert budget > 0, f"Expert count budget must be positive, got {budget}"
+        self._expert_cap = int(budget)
+        self._expert_cap_config = None
+        if self._cap_suspend_depth == 0:
+            self._apply_expert_caps()
+
+    def set_probability_expert_selection(self, target: float) -> None:
+        """Set probability-based expert selection (preserve routing probability mass)."""
+        assert 0 < target <= 1, f"Probability budget target must be in (0, 1], got {target}"
+        config: Dict[str, Any] = {
+            "mode": "probability",
+            "target": float(target),
+        }
+        self._expert_cap = None
+        self._expert_cap_config = config
         if self._cap_suspend_depth == 0:
             self._apply_expert_caps()
 
     @contextmanager
     def suspend_expert_cap(self):
         """Temporarily disable expert capping (e.g., during KV prefill)."""
-        if self._expert_cap is None and not self._expert_cap_schedule:
+        if self._expert_cap is None and not self._expert_cap_config:
             yield
             return
         if self._cap_suspend_depth == 0:
-            self._set_all_expert_caps(None)
+            self._set_all_expert_caps(None, None)
         self._cap_suspend_depth += 1
         try:
             yield
@@ -1178,6 +1166,11 @@ class EaModel(nn.Module):
         if self.oracle is None:
             return None
         return self.oracle.finish_turn()
+
+    def pop_last_cap_usage_means(self) -> List[float]:
+        data = list(self._last_cap_usage_means)
+        self._last_cap_usage_means = []
+        return data
 
     def forward(
             self,
@@ -1284,11 +1277,15 @@ class EaModel(nn.Module):
         accept_lengths = []  # Track acceptance lengths per iteration
         iteration_traces: List[Dict[str, Any]] = []
         max_length = max_length - self.ea_layer.total_tokens - 10
+        iteration_cap_means: List[float] = []
         for idx in range(max_length):
             if pending_cap is not None:
                 self.set_expert_cap(pending_cap)
                 pending_cap = None
             cap_for_iteration = getattr(self, "_expert_cap", None)
+            tracker_reset = getattr(self.base_model.model, "reset_cap_usage_tracker", None)
+            if callable(tracker_reset):
+                tracker_reset()
             iter_start_time = time.time()
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
@@ -1609,6 +1606,11 @@ class EaModel(nn.Module):
                     requested_cap = on_iter_end(idx, iteration_metrics)
                     if requested_cap is not None:
                         pending_cap = int(requested_cap)
+            tracker_finalize = getattr(self.base_model.model, "finalize_cap_usage", None)
+            if callable(tracker_finalize):
+                cap_mean = tracker_finalize()
+                if cap_mean is not None:
+                    iteration_cap_means.append(float(cap_mean))
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -1626,6 +1628,7 @@ class EaModel(nn.Module):
                 finish_cb()
         if original_cap != getattr(self, "_expert_cap", None):
             self.set_expert_cap(original_cap)
+        self._last_cap_usage_means = iteration_cap_means
         if not log:
             return input_ids
         else:

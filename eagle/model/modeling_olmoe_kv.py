@@ -5,7 +5,7 @@
 import math
 import os
 import weakref
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -455,6 +455,8 @@ class OlmoeSparseMoeBlock(nn.Module):
         self.layer_idx: Optional[int] = None
         self.trace_recorder = None
         self.expert_cap: Optional[int] = None
+        self.expert_cap_config: Optional[Dict[str, Any]] = None
+        self.expert_pruning_strategy: str = "substitution"
         self._last_cap_shortlist: Optional[torch.Tensor] = None
         self.cap_depth_decay: float = float(getattr(config, "moe_cap_depth_decay", 0.7))
         self._routing_provider_ref: Optional[weakref.ReferenceType] = None
@@ -551,14 +553,60 @@ class OlmoeSparseMoeBlock(nn.Module):
 
         shortlist_indices: Optional[torch.Tensor] = None
         masked_logits = router_logits
+        effective_cap = self.num_experts
         cap = self.expert_cap
-        if cap is not None and cap > 0:
+        cap_config = self.expert_cap_config
+
+        if cap_config is not None:
+            cap_mode = cap_config["mode"]
+            if cap_mode == "probability":
+                target = cap_config["target"]
+                min_cap = max(self.top_k, 1)
+                max_cap = self.num_experts
+                scores = torch.nan_to_num(importance, nan=0.0, neginf=0.0, posinf=0.0)
+                sorted_scores, sorted_indices = torch.sort(scores, descending=True)
+                total_score = torch.sum(sorted_scores)
+
+                assert not torch.isnan(total_score), "Total routing score is NaN"
+                assert total_score > 0, f"Total routing score must be positive, got {total_score}"
+
+                cumulative = torch.cumsum(sorted_scores, dim=0) / total_score
+                keep_mask = cumulative < target
+                dynamic_k = int(keep_mask.sum().item()) + 1
+                dynamic_k = max(dynamic_k, min_cap)
+                dynamic_k = min(dynamic_k, max_cap)
+
+                if dynamic_k < self.num_experts:
+                    shortlist_indices = sorted_indices[:dynamic_k]
+                    assert shortlist_indices.numel() > 0, "Shortlist indices should not be empty"
+                    mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
+                    mask.index_fill_(0, shortlist_indices, False)
+                    masked_logits = router_logits.masked_fill(mask, float("-inf"))
+                effective_cap = dynamic_k
+            if os.environ.get("EAGLE_DEBUG_CAP"):
+                if not hasattr(self, "_debug_cap_prints"):
+                    self._debug_cap_prints = 0
+                if self._debug_cap_prints < 5:
+                    self._debug_cap_prints += 1
+                    prefix_len = metadata.get("prefix_len") if metadata else None
+                    tree_tokens = routing_probs_full.size(0) - int(prefix_len or 0)
+                    kept_mass = (
+                        sorted_scores[:dynamic_k].sum().item()
+                        if shortlist_indices is not None
+                        else scores.sum().item()
+                    )
+                    print(
+                        f"[eagle-cap-debug] mode=probability layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
+                        f"tree_tok={tree_tokens} target={target:.2f} cap={dynamic_k} kept_mass={kept_mass:.3f}",
+                        flush=True,
+                    )
+        elif cap is not None:
+            assert cap > 0, f"Expert cap must be positive, got {cap}"
             effective_cap = min(max(int(cap), self.top_k), self.num_experts)
             if effective_cap < self.num_experts:
                 scores = torch.nan_to_num(importance, nan=0.0, neginf=0.0, posinf=0.0)
                 _, shortlist_indices = torch.topk(scores, effective_cap, dim=0)
-                if shortlist_indices.numel() == 0:
-                    shortlist_indices = torch.arange(effective_cap, device=router_logits.device)
+                assert shortlist_indices.numel() > 0, "Shortlist indices should not be empty"
                 mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
                 mask.index_fill_(0, shortlist_indices, False)
                 masked_logits = router_logits.masked_fill(mask, float("-inf"))
@@ -571,7 +619,7 @@ class OlmoeSparseMoeBlock(nn.Module):
                         tree_tokens = routing_probs_full.size(0) - int(prefix_len or 0)
                         kept_mass = scores[shortlist_indices].sum().item()
                         print(
-                            f"[eagle-cap-debug] layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
+                            f"[eagle-cap-debug] mode=cardinality layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
                             f"tree_tok={tree_tokens} cap={effective_cap} kept_mass={kept_mass:.3f}",
                             flush=True,
                         )
@@ -587,8 +635,30 @@ class OlmoeSparseMoeBlock(nn.Module):
         if self.trace_recorder is not None and shortlist_indices is not None:
             precap_shortlist = shortlist_indices.detach().to("cpu").tolist()
 
-        _, selected_experts = torch.topk(masked_logits, self.top_k, dim=-1)
-        routing_weights = routing_probs_full.gather(-1, selected_experts)
+        # Apply pruning strategy
+        if shortlist_indices is not None:
+            if self.expert_pruning_strategy == "substitution":
+                # Substitution: constrain top-k selection to shortlist, use original probabilities
+                # Mask forces selection from shortlist, but we gather from original softmax
+                _, selected_experts = torch.topk(masked_logits, self.top_k, dim=-1)
+                routing_weights = routing_probs_full.gather(-1, selected_experts)
+            elif self.expert_pruning_strategy == "truncation":
+                # Truncation: natural top-k selection, then zero out non-shortlisted experts
+                _, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+                routing_weights = routing_probs_full.gather(-1, selected_experts)
+                # Zero out weights for experts not in shortlist
+                # Create mask: True where selected expert is NOT in shortlist
+                shortlist_set = shortlist_indices.unsqueeze(0).expand(selected_experts.size(0), -1)
+                is_in_shortlist = (selected_experts.unsqueeze(-1) == shortlist_set.unsqueeze(1)).any(dim=-1)
+                routing_weights = routing_weights * is_in_shortlist.float()
+            else:
+                raise ValueError(f"Unknown expert_pruning_strategy: {self.expert_pruning_strategy}")
+        else:
+            # No capping - baseline behavior
+            _, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+            routing_weights = routing_probs_full.gather(-1, selected_experts)
+
+        # Apply model-specific top-k normalization if configured
         if self.norm_topk_prob:
             denom = routing_weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
             routing_weights = routing_weights / denom
@@ -631,6 +701,14 @@ class OlmoeSparseMoeBlock(nn.Module):
                 full_weights=full_weights_per_token.detach(),
                 precap_shortlist=precap_shortlist,
             )
+        provider = self._routing_provider_ref() if self._routing_provider_ref is not None else None
+        if provider is not None:
+            recorder = getattr(provider, "record_cap_usage", None)
+            if callable(recorder):
+                try:
+                    recorder(self.layer_idx if self.layer_idx is not None else -1, int(effective_cap))
+                except Exception:
+                    pass
 
         num_tokens = batch_size * sequence_length
         final_hidden_states = torch.zeros(
@@ -931,6 +1009,8 @@ class OlmoeModel(OlmoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
         self._routing_metadata: Optional[Dict[str, Union[int, torch.Tensor]]] = None
+        self._cap_usage_samples: Optional[List[int]] = None
+        self._cap_usage_history: List[float] = []
 
         for layer in self.layers:
             mlp = getattr(layer, "mlp", None)
@@ -987,6 +1067,32 @@ class OlmoeModel(OlmoePreTrainedModel):
 
     def clear_routing_metadata(self) -> None:
         self._routing_metadata = None
+
+    def reset_cap_usage_tracker(self) -> None:
+        self._cap_usage_samples = []
+
+    def record_cap_usage(self, _layer_idx: int, cap_value: int) -> None:
+        if self._cap_usage_samples is None:
+            return
+        try:
+            self._cap_usage_samples.append(int(cap_value))
+        except (TypeError, ValueError):
+            pass
+
+    def finalize_cap_usage(self) -> Optional[float]:
+        samples = self._cap_usage_samples
+        if not samples:
+            self._cap_usage_samples = []
+            return None
+        mean_val = float(sum(samples) / len(samples))
+        self._cap_usage_history.append(mean_val)
+        self._cap_usage_samples = []
+        return mean_val
+
+    def pop_cap_usage_history(self) -> List[float]:
+        history = list(self._cap_usage_history)
+        self._cap_usage_history = []
+        return history
 
     @add_start_docstrings_to_model_forward(OLMOE_INPUTS_DOCSTRING)
     def forward(

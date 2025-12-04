@@ -28,13 +28,12 @@ def _load_questions(question_file: Path) -> Dict[int, Dict[str, Any]]:
 
 
 def _extract_reference(question: Dict[str, Any]) -> str:
-    refs = question.get("reference") or []
+    refs = question["reference"]
+    assert len(refs) > 0, f"Reference answer missing for question {question['question_id']}"
     for ref in refs:
         if "####" in ref:
             return ref.split("####")[-1].strip()
-    if refs:
-        return str(refs[0]).strip()
-    raise ValueError(f"Reference answer missing for question {question['question_id']}")
+    return str(refs[0]).strip()
 
 
 def _extract_prediction(text: str) -> str:

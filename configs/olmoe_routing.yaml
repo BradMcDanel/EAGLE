@@ -1,0 +1,5 @@
+models:
+  - id: olmoe-1b
+    base_model: allenai/OLMoE-1B-7B-0125-Instruct
+    ea_model: wantsleep/OLMoE_1B_7B_Eagle3
+    gpus: "0"

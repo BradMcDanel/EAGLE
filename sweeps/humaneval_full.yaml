@@ -1,0 +1,28 @@
+# Complete HumanEval evaluation sweep
+# Full dataset with comprehensive parameter exploration
+
+model:
+  base_path: "allenai/OLMoE-1B-7B-0125-Instruct"
+  eagle_path: "wantsleep/OLMoE_1B_7B_Eagle3"
+  gpus_per_run: 1
+
+# Single dataset - HumanEval only
+datasets: [humaneval]
+
+# Test both temperatures (greedy and sampling)
+temperatures: [0.0, 1.0]
+
+# Test both draft token settings
+draft_tokens: [31, 63]
+
+# Test both pruning strategies
+pruning_strategies: [substitution, truncation]
+
+# Comprehensive expert selection budgets
+expert_selection:
+  cardinality: [8, 16, 24, 32]
+  probability: [0.50, 0.60, 0.70, 0.80, 0.90]
+
+# Options
+# num_samples: null means use ALL 80 samples from HumanEval
+overwrite: false  # Skip existing runs by default

@@ -60,15 +60,17 @@ def score(
             record = json.loads(line)
             qid = int(record["question_id"])
             question = questions[qid]
-            reference_list = question.get("reference") or []
+            reference_list = question["reference"]
+            assert len(reference_list) > 0, f"Reference missing for question {qid}"
             reference = " ".join(reference_list).strip()
 
             turns: List[str] = record["choices"][0]["turns"]
-            prediction = turns[-1].strip() if turns else ""
+            assert len(turns) > 0, f"No turns found for question {qid}"
+            prediction = turns[-1].strip()
 
             rouge = _rouge_l(prediction, reference)
             stats = record["choices"][0].get("stats", [])
-            stat = stats[-1] if stats else {}
+            stat = stats[-1] if len(stats) > 0 else {}
 
             details.append(
                 {

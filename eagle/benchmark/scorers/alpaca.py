@@ -68,14 +68,16 @@ def score(
         for line in fh:
             record = json.loads(line)
             qid = int(record["question_id"])
-            question = questions.get(qid)
-            references = question.get("reference", []) if question else []
+            assert qid in questions, f"Question {qid} not found in question file"
+            question = questions[qid]
+            references = question["reference"]
 
             turns: List[str] = record["choices"][0]["turns"]
-            prediction = turns[-1] if turns else ""
+            assert len(turns) > 0, f"No turns found for question {qid}"
+            prediction = turns[-1]
 
             stats = record["choices"][0].get("stats", [])
-            stat = stats[-1] if stats else {}
+            stat = stats[-1] if len(stats) > 0 else {}
 
             if references:
                 em_scores = [_exact_match(prediction, ref) for ref in references]
