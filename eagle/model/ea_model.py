@@ -1445,7 +1445,7 @@ class EaModel(nn.Module):
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
-            candidates = draft_tokens[0, retrieve_indices]
+            candidates = draft_tokens[0, retrieve_indices.to(draft_tokens.device)]
             # verification
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
@@ -1784,7 +1784,7 @@ class EaModel(nn.Module):
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
-            candidates = draft_tokens[0, retrieve_indices]
+            candidates = draft_tokens[0, retrieve_indices.to(draft_tokens.device)]
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )

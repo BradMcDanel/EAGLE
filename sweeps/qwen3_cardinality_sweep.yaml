@@ -1,0 +1,14 @@
+model:
+  base_path: "Qwen/Qwen3-30B-A3B"
+  eagle_path: "Tengyunw/qwen3_30b_moe_eagle3"
+  gpus_per_run: 1
+
+datasets: [gsm8k, alpaca, sum, humaneval]
+temperatures: [0.0, 1.0]
+draft_tokens: [63]
+pruning_strategies: [substitution, truncation]
+
+expert_selection:
+  cardinality: [8, 12, 16, 20, 24, 32, 40, 48]
+
+overwrite: false

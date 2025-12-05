@@ -21,9 +21,10 @@
 
 import os
 import weakref
-from typing import Callable, Dict, Optional, Union, Tuple, List
+from typing import Any, Callable, Dict, Optional, Union, Tuple, List
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from transformers.activations import ACT2FN
@@ -273,6 +274,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.layer_idx: Optional[int] = None
         self.trace_recorder = None
         self.expert_cap: Optional[int] = None
+        self.expert_cap_config: Optional[Dict[str, Any]] = None
+        self.expert_pruning_strategy: str = "substitution"
         self._last_cap_shortlist: Optional[torch.Tensor] = None
         self.cap_depth_decay: float = float(getattr(config, "moe_cap_depth_decay", 0.7))
         self._routing_provider_ref: Optional[weakref.ReferenceType] = None
@@ -293,7 +296,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
-        routing_probs_full = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_probs_full = F.softmax(router_logits, dim=1, dtype=torch.float)
 
         metadata = None
         provider = self._routing_provider_ref() if self._routing_provider_ref is not None else None
@@ -362,36 +365,67 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         shortlist_indices: Optional[torch.Tensor] = None
         masked_logits = router_logits
+        effective_cap = self.num_experts
         cap = self.expert_cap
-        if cap is not None and cap > 0:
-            effective_cap = min(max(cap, self.top_k), self.num_experts)
-            if effective_cap < self.num_experts:
-                top1_experts = torch.argmax(router_logits, dim=1)
-                essential = torch.unique(top1_experts)
-                if essential.numel() == 0:
-                    essential = essential.new_empty(0)
+        cap_config = self.expert_cap_config
 
-                if essential.numel() > effective_cap:
-                    essential_scores = importance[essential]
-                    keep_idx = torch.topk(essential_scores, effective_cap, dim=0).indices
-                    shortlist_indices = essential[keep_idx]
-                else:
-                    remaining = effective_cap - int(essential.numel())
-                    if remaining > 0:
-                        remaining_scores = importance.clone()
-                        if essential.numel() > 0:
-                            remaining_scores[essential] = float("-inf")
-                        extra_indices = torch.topk(remaining_scores, remaining, dim=0).indices
-                        shortlist_indices = (
-                            torch.cat([essential, extra_indices])
-                            if essential.numel() > 0
-                            else extra_indices
-                        )
-                    else:
-                        shortlist_indices = essential
-                mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
-                mask.index_fill_(0, shortlist_indices, False)
-                masked_logits = router_logits.masked_fill(mask, float("-inf"))
+        if cap_config is not None:
+            cap_mode = cap_config["mode"]
+            if cap_mode == "probability":
+                target = cap_config["target"]
+                min_cap = max(self.top_k, 1)
+                max_cap = self.num_experts
+                scores = torch.nan_to_num(importance, nan=0.0, neginf=0.0, posinf=0.0)
+                sorted_scores, sorted_indices = torch.sort(scores, descending=True)
+                total_score = torch.sum(sorted_scores)
+
+                assert not torch.isnan(total_score), "Total routing score is NaN"
+                assert total_score > 0, f"Total routing score must be positive, got {total_score}"
+
+                cumulative = torch.cumsum(sorted_scores, dim=0) / total_score
+                keep_mask = cumulative < target
+                dynamic_k = int(keep_mask.sum().item()) + 1
+                dynamic_k = max(dynamic_k, min_cap)
+                dynamic_k = min(dynamic_k, max_cap)
+
+                if dynamic_k < self.num_experts:
+                    shortlist_indices = sorted_indices[:dynamic_k]
+                    assert shortlist_indices.numel() > 0, "Shortlist indices should not be empty"
+                    # Only create masked_logits for substitution strategy
+                    if self.expert_pruning_strategy == "substitution":
+                        mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
+                        mask.index_fill_(0, shortlist_indices, False)
+                        masked_logits = router_logits.masked_fill(mask, float("-inf"))
+                effective_cap = dynamic_k
+            if os.environ.get("EAGLE_DEBUG_CAP"):
+                if not hasattr(self, "_debug_cap_prints"):
+                    self._debug_cap_prints = 0
+                if self._debug_cap_prints < 5:
+                    self._debug_cap_prints += 1
+                    prefix_len = metadata.get("prefix_len") if metadata else None
+                    tree_tokens = routing_probs_full.size(0) - int(prefix_len or 0)
+                    kept_mass = (
+                        sorted_scores[:dynamic_k].sum().item()
+                        if shortlist_indices is not None
+                        else scores.sum().item()
+                    )
+                    print(
+                        f"[eagle-cap-debug] mode=probability layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
+                        f"tree_tok={tree_tokens} target={target:.2f} cap={dynamic_k} kept_mass={kept_mass:.3f}",
+                        flush=True,
+                    )
+        elif cap is not None:
+            assert cap > 0, f"Expert cap must be positive, got {cap}"
+            effective_cap = min(max(int(cap), self.top_k), self.num_experts)
+            if effective_cap < self.num_experts:
+                scores = torch.nan_to_num(importance, nan=0.0, neginf=0.0, posinf=0.0)
+                _, shortlist_indices = torch.topk(scores, effective_cap, dim=0)
+                assert shortlist_indices.numel() > 0, "Shortlist indices should not be empty"
+                # Only create masked_logits for substitution strategy
+                if self.expert_pruning_strategy == "substitution":
+                    mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
+                    mask.index_fill_(0, shortlist_indices, False)
+                    masked_logits = router_logits.masked_fill(mask, float("-inf"))
                 if os.environ.get("EAGLE_DEBUG_CAP"):
                     if not hasattr(self, "_debug_cap_prints"):
                         self._debug_cap_prints = 0
@@ -399,9 +433,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                         self._debug_cap_prints += 1
                         prefix_len = metadata.get("prefix_len") if metadata else None
                         tree_tokens = routing_probs_full.size(0) - int(prefix_len or 0)
+                        kept_mass = scores[shortlist_indices].sum().item()
                         print(
-                            f"[eagle-cap-debug] layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
-                            f"tree_tok={tree_tokens} cap={effective_cap} essential={essential.numel()} ",
+                            f"[eagle-cap-debug] mode=cardinality layer={self.layer_idx} total_tok={routing_probs_full.size(0)} "
+                            f"tree_tok={tree_tokens} cap={effective_cap} kept_mass={kept_mass:.3f}",
                             flush=True,
                         )
         self._last_cap_shortlist = shortlist_indices
@@ -416,12 +451,32 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.trace_recorder is not None and shortlist_indices is not None:
             precap_shortlist = shortlist_indices.detach().to("cpu").tolist()
 
-        _, selected_experts = torch.topk(masked_logits, self.top_k, dim=-1)
-        routing_weights = routing_probs_full.gather(-1, selected_experts)
+        # Apply pruning strategy
+        if shortlist_indices is not None:
+            if self.expert_pruning_strategy == "substitution":
+                # Substitution: constrain top-k selection to shortlist, use original probabilities
+                # Mask forces selection from shortlist, but we gather from original softmax
+                _, selected_experts = torch.topk(masked_logits, self.top_k, dim=-1)
+                routing_weights = routing_probs_full.gather(-1, selected_experts)
+            elif self.expert_pruning_strategy == "truncation":
+                # Truncation: natural top-k selection, then zero out non-shortlisted experts
+                _, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+                routing_weights = routing_probs_full.gather(-1, selected_experts)
+                # Zero out weights for experts not in shortlist
+                is_in_shortlist = torch.isin(selected_experts, shortlist_indices)
+                routing_weights = routing_weights * is_in_shortlist.float()
+            else:
+                raise ValueError(f"Unknown expert_pruning_strategy: {self.expert_pruning_strategy}")
+        else:
+            # No capping - baseline behavior
+            _, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+            routing_weights = routing_probs_full.gather(-1, selected_experts)
 
+        # Apply model-specific top-k normalization if configured
         if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
             denom = routing_weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
             routing_weights = routing_weights / denom
+
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
         selected_experts = selected_experts.to(torch.long)
@@ -459,34 +514,94 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 full_weights=full_weights_per_token.detach(),
                 precap_shortlist=precap_shortlist,
             )
+        provider = self._routing_provider_ref() if self._routing_provider_ref is not None else None
+        if provider is not None:
+            recorder = getattr(provider, "record_cap_usage", None)
+            if callable(recorder):
+                try:
+                    recorder(self.layer_idx if self.layer_idx is not None else -1, int(effective_cap))
+                except Exception:
+                    pass
 
+        num_tokens = batch_size * sequence_length
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            (num_tokens, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        token_indices = torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand(-1, self.top_k)
+        flat_tokens = token_indices.reshape(-1)
+        flat_experts = selected_experts.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
 
-        expert_hit_all = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False).squeeze(-1)
-        expert_hit = expert_hit_all
+        nonzero = flat_weights != 0
+        flat_tokens = flat_tokens[nonzero]
+        flat_experts = flat_experts[nonzero]
+        flat_weights = flat_weights[nonzero]
 
+        if flat_tokens.numel() == 0:
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states, router_logits
+
+        sorted_order = torch.argsort(flat_experts)
+        flat_experts = flat_experts[sorted_order]
+        flat_tokens = flat_tokens[sorted_order]
+        flat_weights = flat_weights[sorted_order]
+
+        unique_experts, counts = torch.unique_consecutive(flat_experts, return_counts=True)
         if expert_counter_list is not None:
-            expert_counter_list.append(int(expert_hit.numel()))
+            expert_counter_list.append(int(unique_experts.numel()))
 
-        for expert_idx in expert_hit.tolist():
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+        num_active = int(unique_experts.numel())
+        max_count = int(counts.max().item()) if num_active > 0 else 0
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+        if num_active == 0 or max_count == 0:
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states, router_logits
 
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        token_hidden = hidden_states.index_select(0, flat_tokens)
+
+        batched_hidden = hidden_states.new_zeros((num_active, max_count, hidden_dim))
+        batched_weights = flat_weights.new_zeros((num_active, max_count))
+        batched_mask = torch.zeros((num_active, max_count), dtype=torch.bool, device=hidden_states.device)
+
+        expert_starts = torch.cumsum(counts, dim=0) - counts
+        start_list = expert_starts.tolist()
+        count_list = counts.tolist()
+
+        for batch_row, (start_idx, count_val) in enumerate(zip(start_list, count_list)):
+            count_int = int(count_val)
+            if count_int <= 0:
+                continue
+            end_idx = start_idx + count_int
+            batched_hidden[batch_row, :count_int] = token_hidden[start_idx:end_idx]
+            batched_weights[batch_row, :count_int] = flat_weights[start_idx:end_idx]
+            batched_mask[batch_row, :count_int] = True
+
+        expert_indices = [int(idx) for idx in unique_experts.tolist()]
+
+        gate_w = torch.stack([self.experts[idx].gate_proj.weight for idx in expert_indices], dim=0).transpose(1, 2)
+        up_w = torch.stack([self.experts[idx].up_proj.weight for idx in expert_indices], dim=0).transpose(1, 2)
+        down_w = torch.stack([self.experts[idx].down_proj.weight for idx in expert_indices], dim=0).transpose(1, 2)
+
+        dtype = batched_hidden.dtype
+        gate_w = gate_w.to(dtype)
+        up_w = up_w.to(dtype)
+        down_w = down_w.to(dtype)
+
+        gate_out = torch.matmul(batched_hidden, gate_w)
+        up_out = torch.matmul(batched_hidden, up_w)
+        activated = self.experts[expert_indices[0]].act_fn(gate_out)
+        intermediate = activated * up_out
+        expert_output = torch.matmul(intermediate, down_w)
+
+        mask = batched_mask.unsqueeze(-1)
+        expert_output = expert_output.masked_fill(~mask, 0)
+
+        scaled_output = expert_output * batched_weights.unsqueeze(-1).to(expert_output.dtype)
+
+        valid_output = scaled_output[batched_mask].to(hidden_states.dtype)
+        final_hidden_states.index_add_(0, flat_tokens, valid_output)
+
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
@@ -609,6 +724,8 @@ class Qwen3MoeAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
+        cos = cos.to(query_states.device)
+        sin = sin.to(query_states.device)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
@@ -790,6 +907,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
         self._routing_metadata: Optional[Dict[str, Union[int, torch.Tensor]]] = None
+        self._cap_usage_samples: Optional[List[int]] = None
+        self._cap_usage_history: List[float] = []
 
         for layer in self.layers:
             mlp = getattr(layer, "mlp", None)
@@ -845,6 +964,32 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
     def clear_routing_metadata(self) -> None:
         self._routing_metadata = None
+
+    def reset_cap_usage_tracker(self) -> None:
+        self._cap_usage_samples = []
+
+    def record_cap_usage(self, _layer_idx: int, cap_value: int) -> None:
+        if self._cap_usage_samples is None:
+            return
+        try:
+            self._cap_usage_samples.append(int(cap_value))
+        except (TypeError, ValueError):
+            pass
+
+    def finalize_cap_usage(self) -> Optional[float]:
+        samples = self._cap_usage_samples
+        if not samples:
+            self._cap_usage_samples = []
+            return None
+        mean_val = float(sum(samples) / len(samples))
+        self._cap_usage_history.append(mean_val)
+        self._cap_usage_samples = []
+        return mean_val
+
+    def pop_cap_usage_history(self) -> List[float]:
+        history = list(self._cap_usage_history)
+        self._cap_usage_history = []
+        return history
 
     @can_return_tuple
     @auto_docstring

@@ -381,8 +381,9 @@ class OlmoeAttention(nn.Module):
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
 
-        # Prepare position embeddings
         cos, sin = self.rotary_emb(query_states, position_ids)
+        cos = cos.to(query_states.device)
+        sin = sin.to(query_states.device)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
@@ -485,67 +486,59 @@ class OlmoeSparseMoeBlock(nn.Module):
             if callable(getter):
                 metadata = getter()
 
-        def _compute_token_weights() -> Optional[torch.Tensor]:
-            if metadata is None:
-                return None
-
+        weights: Optional[torch.Tensor] = None
+        if metadata is not None:
             total_tokens = routing_probs_full.size(0)
-            if total_tokens == 0:
-                return None
-
-            weights_local = torch.ones(
-                total_tokens,
-                dtype=routing_probs_full.dtype,
-                device=routing_probs_full.device,
-            )
-
-            prefix_val = metadata.get("prefix_len", 0)
-            prefix_len = int(prefix_val.item()) if isinstance(prefix_val, torch.Tensor) else int(prefix_val)
-            tree_tokens = max(total_tokens - prefix_len, 0)
-            if tree_tokens == 0:
-                return weights_local
-
-            slice_len = tree_tokens
-            depths = metadata.get("depths")
-            log_probs = metadata.get("log_probs")
-
-            if depths is not None:
-                depths = depths.to(routing_probs_full.device)
-                slice_len = min(slice_len, depths.numel())
-            if log_probs is not None:
-                log_probs = log_probs.to(routing_probs_full.device)
-                slice_len = min(slice_len, log_probs.numel())
-
-            if slice_len == 0:
-                return weights_local
-
-            depth_decay = float(self.cap_depth_decay)
-            if depths is not None and 0.0 < depth_decay < 1.0:
-                depth_vals = depths[:slice_len].to(routing_probs_full.dtype)
-                base = torch.full_like(depth_vals, depth_decay)
-                depth_weights = torch.pow(base, depth_vals)
-            else:
-                depth_weights = torch.ones(
-                    slice_len,
+            if total_tokens > 0:
+                weights = torch.ones(
+                    total_tokens,
                     dtype=routing_probs_full.dtype,
                     device=routing_probs_full.device,
                 )
-
-            if log_probs is not None:
-                log_vals = log_probs[:slice_len].to(routing_probs_full.dtype)
-                max_log = torch.nan_to_num(log_vals.max(), nan=0.0)
-                if torch.isfinite(max_log):
-                    log_vals = log_vals - max_log
-                    prob_weights = torch.exp(log_vals).clamp_min(1e-8)
+                prefix_val = metadata.get("prefix_len", 0)
+                if isinstance(prefix_val, torch.Tensor):
+                    prefix_len = int(prefix_val.item())
                 else:
-                    prob_weights = torch.ones_like(depth_weights)
-            else:
-                prob_weights = torch.ones_like(depth_weights)
+                    prefix_len = int(prefix_val)
+                tree_tokens = max(total_tokens - prefix_len, 0)
+                if tree_tokens > 0:
+                    slice_len = tree_tokens
+                    depths = metadata.get("depths")
+                    log_probs = metadata.get("log_probs")
 
-            weights_local[prefix_len:prefix_len + slice_len] = depth_weights * prob_weights
-            return weights_local
+                    if depths is not None:
+                        depths = depths.to(routing_probs_full.device)
+                        slice_len = min(slice_len, depths.numel())
+                    if log_probs is not None:
+                        log_probs = log_probs.to(routing_probs_full.device)
+                        slice_len = min(slice_len, log_probs.numel())
 
-        weights = _compute_token_weights()
+                    if slice_len > 0:
+                        depth_decay = float(self.cap_depth_decay)
+                        if depths is not None and 0.0 < depth_decay < 1.0:
+                            depth_vals = depths[:slice_len].to(routing_probs_full.dtype)
+                            decay_tensor = torch.full_like(depth_vals, depth_decay)
+                            depth_weights = torch.pow(decay_tensor, depth_vals)
+                        else:
+                            depth_weights = torch.ones(
+                                slice_len,
+                                dtype=routing_probs_full.dtype,
+                                device=routing_probs_full.device,
+                            )
+
+                        if log_probs is not None:
+                            log_vals = log_probs[:slice_len].to(routing_probs_full.dtype)
+                            max_log = torch.nan_to_num(log_vals.max(), nan=0.0)
+                            if torch.isfinite(max_log):
+                                log_vals = log_vals - max_log
+                                prob_weights = torch.exp(log_vals).clamp_min(1e-8)
+                            else:
+                                prob_weights = torch.ones_like(depth_weights)
+                        else:
+                            prob_weights = torch.ones_like(depth_weights)
+
+                        weights[prefix_len:prefix_len + slice_len] = depth_weights * prob_weights
+
         if weights is not None:
             importance = torch.sum(routing_probs_full * weights.unsqueeze(1), dim=0)
         else:
@@ -579,9 +572,11 @@ class OlmoeSparseMoeBlock(nn.Module):
                 if dynamic_k < self.num_experts:
                     shortlist_indices = sorted_indices[:dynamic_k]
                     assert shortlist_indices.numel() > 0, "Shortlist indices should not be empty"
-                    mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
-                    mask.index_fill_(0, shortlist_indices, False)
-                    masked_logits = router_logits.masked_fill(mask, float("-inf"))
+                    # Only create masked_logits for substitution strategy
+                    if self.expert_pruning_strategy == "substitution":
+                        mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
+                        mask.index_fill_(0, shortlist_indices, False)
+                        masked_logits = router_logits.masked_fill(mask, float("-inf"))
                 effective_cap = dynamic_k
             if os.environ.get("EAGLE_DEBUG_CAP"):
                 if not hasattr(self, "_debug_cap_prints"):
@@ -607,9 +602,11 @@ class OlmoeSparseMoeBlock(nn.Module):
                 scores = torch.nan_to_num(importance, nan=0.0, neginf=0.0, posinf=0.0)
                 _, shortlist_indices = torch.topk(scores, effective_cap, dim=0)
                 assert shortlist_indices.numel() > 0, "Shortlist indices should not be empty"
-                mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
-                mask.index_fill_(0, shortlist_indices, False)
-                masked_logits = router_logits.masked_fill(mask, float("-inf"))
+                # Only create masked_logits for substitution strategy
+                if self.expert_pruning_strategy == "substitution":
+                    mask = torch.ones(self.num_experts, dtype=torch.bool, device=router_logits.device)
+                    mask.index_fill_(0, shortlist_indices, False)
+                    masked_logits = router_logits.masked_fill(mask, float("-inf"))
                 if os.environ.get("EAGLE_DEBUG_CAP"):
                     if not hasattr(self, "_debug_cap_prints"):
                         self._debug_cap_prints = 0
@@ -647,9 +644,7 @@ class OlmoeSparseMoeBlock(nn.Module):
                 _, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
                 routing_weights = routing_probs_full.gather(-1, selected_experts)
                 # Zero out weights for experts not in shortlist
-                # Create mask: True where selected expert is NOT in shortlist
-                shortlist_set = shortlist_indices.unsqueeze(0).expand(selected_experts.size(0), -1)
-                is_in_shortlist = (selected_experts.unsqueeze(-1) == shortlist_set.unsqueeze(1)).any(dim=-1)
+                is_in_shortlist = torch.isin(selected_experts, shortlist_indices)
                 routing_weights = routing_weights * is_in_shortlist.float()
             else:
                 raise ValueError(f"Unknown expert_pruning_strategy: {self.expert_pruning_strategy}")

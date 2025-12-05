@@ -67,6 +67,7 @@ def get_model_id(
     expert_count_budget: Optional[int],
     expert_probability_budget: Optional[float],
     expert_pruning_strategy: str,
+    temperature: float = 1.0,
 ) -> str:
     """Generate model ID from base model path and configuration."""
     if base_model_path not in MODEL_NAME_MAP:
@@ -79,6 +80,11 @@ def get_model_id(
 
     # Build the model ID components
     parts = [base_id]
+
+    # Add temperature first (always explicit)
+    # Format temperature cleanly (e.g., 0.0 -> t0p0, 0.8 -> t0p8, 1.0 -> t1p0)
+    temp_str = f"t{temperature:.1f}".replace(".", "p")
+    parts.append(temp_str)
 
     # Add mode (eagle3 or autoregressive)
     mode = "eagle3" if use_eagle else "autoregressive"
@@ -114,29 +120,26 @@ def run_evaluation(args):
     print(f"Loading model from {args.base_model_path}")
     print(f"EAGLE adapter: {args.ea_model_path if args.use_eagle else 'None (baseline)'}")
 
-    # Always load via EaModel wrapper (provides optimized KV-cache implementation)
+    # Load via EaModel wrapper (provides optimized KV-cache implementation)
     # Baseline mode uses naivegenerate(), EAGLE mode uses eagenerate()
 
-    # For baseline, we need a dummy EAGLE checkpoint path to initialize the wrapper
-    # We can use any EAGLE checkpoint since we only use the base model
+    # Baseline requires an EAGLE checkpoint path to initialize the wrapper
     if not args.use_eagle:
-        # Check if OLMoE - if so, use a default EAGLE checkpoint for initialization
         from transformers import AutoConfig
         Type = AutoConfig.from_pretrained(args.base_model_path).architectures[0]
 
         if Type == 'OlmoeForCausalLM' and not args.ea_model_path:
-            # Use default EAGLE3 checkpoint for OLMoE (only to initialize wrapper, not used in baseline)
             args.ea_model_path = 'wantsleep/OLMoE_1B_7B_Eagle3'
-            print(f"Note: Using {args.ea_model_path} for wrapper initialization (only base model will be used)")
+            print(f"Using {args.ea_model_path} for wrapper initialization")
 
     if not args.ea_model_path:
-        raise ValueError("--ea-model-path is required. For baseline, the same checkpoint path is needed to initialize the wrapper.")
+        raise ValueError("--ea-model-path is required to initialize the wrapper.")
 
     model = EaModel.from_pretrained(
         use_eagle3=True,
         base_model_path=args.base_model_path,
         ea_model_path=args.ea_model_path,
-        total_token=args.total_token if args.use_eagle else 60,
+        total_token=args.total_token,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         device_map="auto",
@@ -378,12 +381,12 @@ def run_evaluation(args):
                         turn_stats['expert_traces'] = []
                     else:
                         turn_stats['expert_traces'] = iteration_traces
-                if turn_stats.get('avg_active_experts') is not None:
-                    all_stats['active_experts'].append(float(turn_stats['avg_active_experts']))
             if args.use_eagle:
                 cap_usage = model.pop_last_cap_usage_means()
                 if cap_usage:
                     turn_stats['avg_active_experts'] = float(np.mean(cap_usage))
+                if turn_stats.get('avg_active_experts') is not None:
+                    all_stats['active_experts'].append(float(turn_stats['avg_active_experts']))
 
             turns_stats.append(turn_stats)
 
@@ -425,7 +428,7 @@ def run_evaluation(args):
         df.to_parquet(training_parquet_path, index=False)
         print(f"Wrote training traces to {training_parquet_path} ({len(df)} rows)")
 
-    # Compute summary statistics (for later use)
+    # Compute summary statistics
     mean_throughput_val = float(np.mean(all_stats['tokens_per_second'])) if all_stats['tokens_per_second'] else 0.0
     mean_accept_val = float(np.mean(all_stats['tokens_per_iter'])) if args.use_eagle and all_stats.get('tokens_per_iter') else 0.0
 
@@ -608,6 +611,7 @@ if __name__ == "__main__":
         expert_count_budget=args.expert_count_budget,
         expert_probability_budget=args.expert_probability_budget,
         expert_pruning_strategy=args.expert_pruning_strategy,
+        temperature=args.temperature,
     )
 
     # Setup paths

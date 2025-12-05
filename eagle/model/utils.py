@@ -381,7 +381,7 @@ def tree_decoding(
             outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
         hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
 
-    logits = tree_logits[0, retrieve_indices]
+    logits = tree_logits[0, retrieve_indices.to(tree_logits.device)]
     return logits, hidden_state, outputs
 
 
@@ -505,7 +505,7 @@ def update_inference_inputs(
     # Update the current length tensor (currently only support batch size is 1)
     current_length_data.fill_(prev_input_len + tgt.shape[-2])
 
-    retrieve_hidden_state_new = hidden_state_new[:, retrieve_indices]
+    retrieve_hidden_state_new = hidden_state_new[:, retrieve_indices.to(hidden_state_new.device)]
     accept_hidden_state_new = retrieve_hidden_state_new[:, best_candidate, : accept_length + 1]
     # token=model.base_model.lm_head(accept_hidden_state_new[:,-1]).argmax()
     # token=token[None,None]
